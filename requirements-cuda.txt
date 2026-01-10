@@ -1,0 +1,8 @@
+# CUDA-specific requirements (Linux with NVIDIA GPU)
+# Install with: pip install -r requirements-cuda.txt
+
+# Include base requirements
+-r requirements-base.txt
+
+# FAISS with GPU support (CUDA 12.x)
+faiss-gpu-cu12

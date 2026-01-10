@@ -1,0 +1,8 @@
+# macOS-specific requirements (Apple Silicon or Intel)
+# Install with: pip install -r requirements-macos.txt
+
+# Include base requirements
+-r requirements-base.txt
+
+# FAISS CPU-only (no GPU support on macOS)
+faiss-cpu

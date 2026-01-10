@@ -1,0 +1,33 @@
+# Base requirements for all platforms
+# Install with: pip install -r requirements-base.txt
+
+# Core ML
+torch
+sentence-transformers
+transformers
+numpy
+pandas
+scikit-learn
+
+# API
+fastapi
+uvicorn
+pydantic
+
+# Utilities
+loguru
+tqdm
+PyYAML
+
+# HuggingFace
+huggingface-hub
+safetensors
+tokenizers
+
+# Data processing
+pyarrow
+datasets
+
+# Build cache
+joblib
+filelock

@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv
+*.log
+
+# Model binaries
+*.index
+*.faiss
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.onnx
+*.npy
+*.npz
+*.pkl
+*.joblib
+
+# Generated metadata
+*_metadata.json
+
+# Generated features - entire folder
+nlpcomponents/datasets/features/
+
+# Generated model artifacts - entire folders
+nlpcomponents/models/
+
+# Cache files
+*.cache
+.cache/
+
+# Logs and results
+logs/
+results/
+
+# Build backups
+.backups/
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Agent files
+CLAUDE.md
+AGENTS.md
+.claude/
