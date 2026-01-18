@@ -12,6 +12,7 @@ from nlpcomponents.config import NLPPipelineConfig
 from nlpcomponents.core.pipeline import NLPPipeline
 from nlpcomponents.build.orchestrator import BuildOrchestrator
 from nlpcomponents.build.executor import BuildExecutor
+from nlpcomponents.cache.embedding_cache import EmbeddingCacheManager
 from nlpcomponents.utils.path_utils import PROJECT_ROOT
 
 def _setup_logging(debug: bool):
@@ -315,6 +316,170 @@ def cmd_interactive(args: argparse.Namespace):
         except Exception as exc:
             print(f"Error: {exc}")
 
+def _get_cache_managers(config: NLPPipelineConfig):
+    """Get cache managers for both classifier and STS."""
+    cache_base = config.output.cache_dir / "embeddings"
+    return {
+        "classifier": EmbeddingCacheManager(cache_base / "classifier", "classifier"),
+        "sts": EmbeddingCacheManager(cache_base / "sts", "sts"),
+    }
+
+
+def cmd_cache_stats(args: argparse.Namespace):
+    """Show embedding cache statistics."""
+    config = _load_config(args)
+    managers = _get_cache_managers(config)
+    
+    total_size = 0
+    total_entries = 0
+    
+    print("=" * 60)
+    print("EMBEDDING CACHE STATISTICS")
+    print("=" * 60)
+    
+    for cache_type, manager in managers.items():
+        stats = manager.get_stats()
+        total_size += stats.total_size_bytes
+        total_entries += stats.total_entries
+        
+        print(f"\n{cache_type.upper()} CACHE:")
+        print(f"  Location: {manager.cache_dir}")
+        
+        if stats.total_entries == 0:
+            print("  Status: Empty")
+            continue
+        
+        print(f"  Entries: {stats.total_entries:,}")
+        print(f"  Tags: {stats.total_tags}")
+        print(f"  Size: {stats.total_size_mb:.2f} MB")
+        print(f"  Model: {stats.embedding_model}")
+        print(f"  Dimension: {stats.embedding_dim}")
+        
+        if args.verbose and stats.entries_per_tag:
+            print(f"\n  Entries per tag (top 10):")
+            sorted_tags = sorted(stats.entries_per_tag.items(), key=lambda x: -x[1])
+            for tag, count in sorted_tags[:10]:
+                print(f"    {tag}: {count}")
+            if len(sorted_tags) > 10:
+                print(f"    ... and {len(sorted_tags) - 10} more tags")
+    
+    print("\n" + "-" * 60)
+    print(f"TOTAL: {total_entries:,} entries, {total_size / (1024*1024):.2f} MB")
+    print("=" * 60)
+    
+    if args.json:
+        result = {
+            cache_type: manager.get_stats().to_dict()
+            for cache_type, manager in managers.items()
+        }
+        print("\nJSON output:")
+        print(json.dumps(result, indent=2))
+
+
+def cmd_cache_clear(args: argparse.Namespace):
+    """Clear embedding cache."""
+    config = _load_config(args)
+    managers = _get_cache_managers(config)
+    
+    # Determine which caches to clear
+    targets = []
+    if args.classifier:
+        targets.append("classifier")
+    if args.sts:
+        targets.append("sts")
+    if args.all or not targets:
+        targets = list(managers.keys())
+    
+    if args.dry_run:
+        print("DRY RUN - Would clear the following caches:")
+        for target in targets:
+            stats = managers[target].get_stats()
+            print(f"  {target}: {stats.total_entries} entries, {stats.total_size_mb:.2f} MB")
+        return
+    
+    for target in targets:
+        manager = managers[target]
+        stats = manager.get_stats()
+        if stats.total_entries == 0:
+            print(f"{target}: Already empty")
+        else:
+            manager.clear()
+            print(f"{target}: Cleared {stats.total_entries} entries ({stats.total_size_mb:.2f} MB)")
+    
+    print("\nCache cleared successfully!")
+
+
+def cmd_cache_gc(args: argparse.Namespace):
+    """Garbage collect orphaned embeddings."""
+    config = _load_config(args)
+    managers = _get_cache_managers(config)
+    
+    # Load current training data to get valid fingerprints
+    train_csv = config.dataset.train_csv
+    if not train_csv.exists():
+        print(f"Training data not found: {train_csv}")
+        print("Cannot determine which embeddings are orphaned without training data.")
+        sys.exit(1)
+    
+    print(f"Loading training data from {train_csv}...")
+    df = pd.read_csv(train_csv)
+    print(f"  {len(df)} questions loaded")
+    
+    # Compute fingerprints for current data
+    current_fps = set()
+    for _, row in df.iterrows():
+        question = str(row['question']) if pd.notna(row['question']) else ""
+        tag = str(row['tag']) if pd.notna(row['tag']) else ""
+        fp = EmbeddingCacheManager.compute_fingerprint(question, tag)
+        current_fps.add(fp)
+    
+    print(f"  {len(current_fps)} unique fingerprints")
+    
+    # Determine which caches to GC
+    targets = []
+    if args.classifier:
+        targets.append("classifier")
+    if args.sts:
+        targets.append("sts")
+    if args.all or not targets:
+        targets = list(managers.keys())
+    
+    total_removed = 0
+    total_freed = 0
+    
+    for target in targets:
+        manager = managers[target]
+        stats_before = manager.get_stats()
+        
+        if stats_before.total_entries == 0:
+            print(f"\n{target}: Cache is empty, skipping")
+            continue
+        
+        print(f"\n{target.upper()} CACHE:")
+        print(f"  Before: {stats_before.total_entries} entries, {stats_before.total_size_mb:.2f} MB")
+        
+        if args.dry_run:
+            # Just detect what would be removed
+            changes = manager.detect_changes(current_fps)
+            print(f"  Would remove: {len(changes.deleted)} orphaned entries")
+        else:
+            entries_removed, bytes_freed = manager.garbage_collect(current_fps)
+            stats_after = manager.get_stats()
+            
+            total_removed += entries_removed
+            total_freed += bytes_freed
+            
+            print(f"  Removed: {entries_removed} entries")
+            print(f"  Freed: {bytes_freed / 1024:.1f} KB")
+            print(f"  After: {stats_after.total_entries} entries, {stats_after.total_size_mb:.2f} MB")
+    
+    if not args.dry_run:
+        print("\n" + "-" * 60)
+        print(f"TOTAL: Removed {total_removed} entries, freed {total_freed / 1024:.1f} KB")
+    
+    print("\nGarbage collection complete!")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="pipelineNLP control CLI")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -378,6 +543,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_int.add_argument("--quiet", action="store_true")
     p_int.add_argument("--dry-run", action="store_true")
     p_int.set_defaults(func=cmd_interactive)
+
+    # Cache management commands
+    p_cache_stats = sub.add_parser("cache-stats", help="Show embedding cache statistics")
+    p_cache_stats.add_argument("--verbose", "-v", action="store_true", help="Show detailed per-tag breakdown")
+    p_cache_stats.add_argument("--json", action="store_true", help="Output as JSON")
+    p_cache_stats.set_defaults(func=cmd_cache_stats)
+
+    p_cache_clear = sub.add_parser("cache-clear", help="Clear embedding cache")
+    p_cache_clear.add_argument("--classifier", action="store_true", help="Clear only classifier cache")
+    p_cache_clear.add_argument("--sts", action="store_true", help="Clear only STS cache")
+    p_cache_clear.add_argument("--all", action="store_true", help="Clear all caches (default if none specified)")
+    p_cache_clear.add_argument("--dry-run", action="store_true", help="Show what would be cleared")
+    p_cache_clear.set_defaults(func=cmd_cache_clear)
+
+    p_cache_gc = sub.add_parser("cache-gc", help="Garbage collect orphaned embeddings")
+    p_cache_gc.add_argument("--classifier", action="store_true", help="GC only classifier cache")
+    p_cache_gc.add_argument("--sts", action="store_true", help="GC only STS cache")
+    p_cache_gc.add_argument("--all", action="store_true", help="GC all caches (default if none specified)")
+    p_cache_gc.add_argument("--dry-run", action="store_true", help="Show what would be removed")
+    p_cache_gc.set_defaults(func=cmd_cache_gc)
 
     return parser
 

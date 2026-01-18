@@ -477,11 +477,13 @@ class BuildOrchestrator:
             elif status == ArtifactStatus.PARTIAL:
                 reason = "metadata exists but model file missing"
 
-            results[artifact_name] = {
+            entry = {
                 "type": self.dependency_graph[artifact_name]["type"],
                 "status": status.value,
-                "reason": reason
             }
+            if reason:
+                entry["reason"] = reason
+            results[artifact_name] = entry
 
         return results
 

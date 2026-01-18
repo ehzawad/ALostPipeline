@@ -78,6 +78,7 @@ class BuildExecutor:
                 "--features-dir", str(self.config.output.features_dir),
                 "--models", str(self.config.output.classifier_dir),
                 "--embedding-model", self.config.classifier.embedding_model,
+                "--cache-dir", str(self.config.output.cache_dir),
                 "--force",
             ] + self._prefix_args()
             
@@ -88,6 +89,7 @@ class BuildExecutor:
                 "--models-dir", str(self.config.output.semantic_dir),
                 "--classifier-dir", str(self.config.output.classifier_dir),
                 "--embedding-model", self.config.semantic.embedding_model,
+                "--cache-dir", str(self.config.output.cache_dir),
                 "--global",
                 "--force",
             ] + self._prefix_args()

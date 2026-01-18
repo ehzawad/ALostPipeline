@@ -25,11 +25,13 @@ class OutputConfig:
     features_dir: Path = Path("datasets/features")
     classifier_dir: Path = Path("models/tag_classifier")
     semantic_dir: Path = Path("models/semantic")
+    cache_dir: Path = Path("cache")
 
     def __post_init__(self):
         self.features_dir = _as_path(self.features_dir, Path("datasets/features"))
         self.classifier_dir = _as_path(self.classifier_dir, Path("models/tag_classifier"))
         self.semantic_dir = _as_path(self.semantic_dir, Path("models/semantic"))
+        self.cache_dir = _as_path(self.cache_dir, Path("cache"))
 
 
 @dataclass

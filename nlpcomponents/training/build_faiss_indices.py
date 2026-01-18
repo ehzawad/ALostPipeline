@@ -20,6 +20,7 @@ if str(ROOT_DIR) not in sys.path:
 from nlpcomponents.config import EmbeddingPrefixConfig, DEFAULT_E5_INSTRUCT_TASK, DEFAULT_EMBEDDING_MODEL
 from nlpcomponents.build.fingerprint import compute_fingerprint
 from nlpcomponents.cache.model_cache import get_default_device
+from nlpcomponents.cache.embedding_cache import EmbeddingCacheManager, get_prefix_config_hash
 from nlpcomponents.build.fingerprint import compute_dataset_fingerprint, compute_classifier_fingerprint
 from nlpcomponents.utils.faiss_utils import get_faiss, is_gpu_available, index_cpu_to_gpu, index_gpu_to_cpu, get_device_string
 from nlpcomponents.utils.path_utils import DATASETS_DIR, SEMANTIC_MODELS_DIR, CLASSIFIER_MODELS_DIR
@@ -34,10 +35,14 @@ class STSTrainer:
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         normalize_embeddings: bool = True,
         prefixes: Optional[EmbeddingPrefixConfig] = None,
+        cache_dir: Optional[Path] = None,
+        use_embedding_cache: bool = True,
     ):
         self.embedding_model_name = embedding_model
         self.normalize_embeddings = normalize_embeddings
         self.prefixes = prefixes or EmbeddingPrefixConfig()
+        self.cache_dir = cache_dir
+        self.use_embedding_cache = use_embedding_cache
         
         self.embedding_model = None
         self.embedding_dim: Optional[int] = None
@@ -57,20 +62,25 @@ class STSTrainer:
 
         return df
 
-    def generate_embeddings(self, questions):
+    def generate_embeddings(self, questions, tags: Optional[list] = None):
+        """
+        Generate embeddings with optional caching support.
+        
+        Args:
+            questions: List of question texts
+            tags: Optional list of tags (required for caching)
+            
+        Returns:
+            numpy array of embeddings
+        """
         logger.info("\nGenerating embeddings...")
         logger.info(f"  Model: {self.embedding_model_name}")
         logger.info(f"  Questions: {len(questions)}")
         logger.info(f"  Normalize: {self.normalize_embeddings}")
         logger.info(f"  Native prompts: {self.prefixes.use_native_prompts}, prefixes enabled: {self.prefixes.use_prefixes}")
         
-        return self._generate_raw_embeddings(questions)
-    
-    def _generate_raw_embeddings(self, questions):
-        questions_to_encode = self.prefixes.format_sts_passages_batch(questions)
-
-        from nlpcomponents.cache.model_cache import get_shared_embedding_model, encode_documents
-
+        from nlpcomponents.cache.model_cache import get_shared_embedding_model
+        
         device = get_default_device()
         logger.info(f"  Device: {device}")
         if device == 'cuda':
@@ -79,7 +89,31 @@ class STSTrainer:
 
         logger.info(f"  Loading model on {device}...")
         self.embedding_model = get_shared_embedding_model(self.embedding_model_name)
+        self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
         logger.info(f"  [OK] Model loaded successfully on {device}")
+        
+        # Check if we can use caching
+        can_use_cache = (
+            self.use_embedding_cache and
+            self.cache_dir is not None and
+            tags is not None and
+            len(tags) == len(questions)
+        )
+
+        if can_use_cache:
+            return self._generate_embeddings_cached(questions, tags, device)
+        else:
+            if self.use_embedding_cache and tags is None:
+                logger.warning("  Embedding cache disabled: tags not provided")
+            elif self.use_embedding_cache and self.cache_dir is None:
+                logger.warning("  Embedding cache disabled: cache_dir not set")
+            return self._generate_raw_embeddings(questions, device)
+    
+    def _generate_raw_embeddings(self, questions, device: str):
+        """Generate embeddings without caching (original behavior)."""
+        from nlpcomponents.cache.model_cache import encode_documents
+        
+        questions_to_encode = self.prefixes.format_sts_passages_batch(questions)
 
         batch_size = 128 if device == 'cuda' else 32
         logger.info(f"  Encoding questions (this may take several minutes)...")
@@ -97,6 +131,86 @@ class STSTrainer:
         self.embedding_dim = embeddings.shape[1]
         logger.info(f"  [OK] Generated embeddings: shape={embeddings.shape}, dtype={embeddings.dtype}")
 
+        return embeddings
+
+    def _generate_embeddings_cached(self, questions, tags, device: str):
+        """Generate embeddings with caching support."""
+        from nlpcomponents.cache.model_cache import encode_documents
+        
+        cache_path = self.cache_dir / "embeddings" / "sts"
+        cache = EmbeddingCacheManager(cache_path, "sts")
+        
+        logger.info(f"  Cache location: {cache_path}")
+        
+        prefix_hash = get_prefix_config_hash(self.prefixes)
+        embedding_dim = self.embedding_dim
+        
+        # Validate cache metadata
+        if cache.exists():
+            if not cache.validate_metadata(
+                embedding_model=self.embedding_model_name,
+                embedding_dim=embedding_dim,
+                normalize_embeddings=self.normalize_embeddings,
+                prefix_config_hash=prefix_hash
+            ):
+                logger.info("  Cache invalidated (config changed), clearing...")
+                cache.clear()
+        
+        # Build fingerprint map
+        df = pd.DataFrame({'question': questions, 'tag': tags})
+        fp_map = cache.compute_fingerprints_batch(df)
+        
+        # Detect changes
+        changes = cache.detect_changes(set(fp_map.keys()))
+        
+        logger.info(f"  Embedding cache: {len(changes.unchanged)} cached, {len(changes.new)} new, {len(changes.deleted)} orphaned")
+        
+        if changes.cache_hit_rate > 0:
+            logger.info(f"  Cache hit rate: {changes.cache_hit_rate:.1%}")
+        
+        # Embed only new questions
+        if changes.new:
+            logger.info(f"  Encoding {len(changes.new)} new questions...")
+            
+            # Get questions in deterministic order
+            new_fps = sorted(changes.new)
+            new_questions = [fp_map[fp].question for fp in new_fps]
+            
+            # Encode (using passage format for FAISS)
+            questions_to_encode = self.prefixes.format_sts_passages_batch(new_questions)
+            batch_size = 128 if device == 'cuda' else 32
+            
+            new_embeddings = encode_documents(
+                self.embedding_model,
+                questions_to_encode,
+                use_native=self.prefixes.use_native_prompts,
+                normalize_embeddings=self.normalize_embeddings,
+                show_progress_bar=True,
+                batch_size=batch_size
+            )
+            
+            # Save to cache
+            cache.save_new_embeddings(set(new_fps), new_embeddings, fp_map)
+            
+            # Save/update metadata
+            cache.save_metadata(
+                embedding_model=self.embedding_model_name,
+                embedding_dim=embedding_dim,
+                normalize_embeddings=self.normalize_embeddings,
+                prefix_config_hash=prefix_hash
+            )
+        else:
+            logger.info("  All embeddings loaded from cache!")
+        
+        # Remove orphaned entries from index
+        if changes.deleted:
+            cache.remove_from_index(changes.deleted)
+        
+        # Assemble final matrix in correct order
+        ordered_fps = [cache.compute_fingerprint(q, t) for q, t in zip(questions, tags)]
+        embeddings = cache.assemble_embeddings(ordered_fps, embedding_dim=embedding_dim)
+        
+        logger.info(f"  [OK] Generated embeddings: shape={embeddings.shape}, dtype={embeddings.dtype}")
         return embeddings
 
     def build_faiss_indices(self, embeddings, indices_to_build='global', use_gpu: bool = True):
@@ -200,7 +314,9 @@ def train_sts(
     classifier_dir: Path = Path("nlpcomponents/models/tag_classifier"),
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     normalize_embeddings: bool = True,
-    prefixes: Optional[EmbeddingPrefixConfig] = None
+    prefixes: Optional[EmbeddingPrefixConfig] = None,
+    cache_dir: Optional[Path] = None,
+    use_embedding_cache: bool = True
 ):
     print("=" * 80)
     print("STS TRAINING - BUILD FAISS INDICES")
@@ -210,6 +326,8 @@ def train_sts(
         embedding_model=embedding_model,
         normalize_embeddings=normalize_embeddings,
         prefixes=prefixes,
+        cache_dir=cache_dir,
+        use_embedding_cache=use_embedding_cache,
     )
 
     metadata_file = models_dir / "sts_metadata.json"
@@ -241,7 +359,10 @@ def train_sts(
 
     df = trainer.load_data(train_file)
 
-    embeddings = trainer.generate_embeddings(df['question'].tolist())
+    embeddings = trainer.generate_embeddings(
+        df['question'].tolist(),
+        df['tag'].tolist()
+    )
 
     indices = trainer.build_faiss_indices(
         embeddings,
@@ -384,6 +505,17 @@ if __name__ == '__main__':
         default="query: ",
         help='Prefix for classifier queries when not using instruct format'
     )
+    parser.add_argument(
+        '--cache-dir',
+        type=Path,
+        default=None,
+        help='Directory for embedding cache (default: models_dir/../cache)'
+    )
+    parser.add_argument(
+        '--no-embedding-cache',
+        action='store_true',
+        help='Disable embedding cache (encode all questions fresh)'
+    )
     
     args = parser.parse_args()
 
@@ -404,6 +536,11 @@ if __name__ == '__main__':
         classifier_query_prefix=args.classifier_query_prefix,
     )
 
+    # Determine cache directory
+    cache_dir = args.cache_dir
+    if cache_dir is None:
+        cache_dir = args.models_dir.parent / "cache"
+
     train_sts(
         indices_to_build=indices_to_build,
         force=args.force,
@@ -413,4 +550,6 @@ if __name__ == '__main__':
         embedding_model=args.embedding_model,
         normalize_embeddings=args.normalize,
         prefixes=prefixes,
+        cache_dir=cache_dir,
+        use_embedding_cache=not args.no_embedding_cache,
     )

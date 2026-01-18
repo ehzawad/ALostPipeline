@@ -24,6 +24,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from nlpcomponents.cache.model_cache import get_shared_embedding_model, get_default_device, encode_queries
+from nlpcomponents.cache.embedding_cache import EmbeddingCacheManager, get_prefix_config_hash
 from nlpcomponents.build.fingerprint import compute_fingerprint
 from nlpcomponents.build.fingerprint import compute_dataset_fingerprint, compute_ngram_fingerprint
 from nlpcomponents.config import EmbeddingPrefixConfig, DEFAULT_E5_INSTRUCT_TASK, DEFAULT_EMBEDDING_MODEL
@@ -57,7 +58,9 @@ class UnifiedTagClassifierTrainer:
         contrastive_weight=0.1,
         features_dir: Optional[Path] = None,
         prefixes: Optional[EmbeddingPrefixConfig] = None,
-        normalize_embeddings: bool = True
+        normalize_embeddings: bool = True,
+        cache_dir: Optional[Path] = None,
+        use_embedding_cache: bool = True
     ):
         self.embedding_model_name = embedding_model
         self.contrastive_weight = contrastive_weight
@@ -67,6 +70,8 @@ class UnifiedTagClassifierTrainer:
         self.tag_encoder = LabelEncoder()
         self.prefixes = prefixes or EmbeddingPrefixConfig()
         self.normalize_embeddings = normalize_embeddings
+        self.cache_dir = cache_dir
+        self.use_embedding_cache = use_embedding_cache
 
     def load_data(self, train_file: Path, eval_file: Path):
         logger.info("Loading training and eval data...")
@@ -174,8 +179,18 @@ class UnifiedTagClassifierTrainer:
     def normalize_features(self, features: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
         return (features - mean) / std
 
-    def generate_embeddings(self, questions):
-        logger.info("Generating embeddings using shared model cache...")
+    def generate_embeddings(self, questions: List[str], tags: Optional[List[str]] = None) -> np.ndarray:
+        """
+        Generate embeddings with optional caching support.
+        
+        Args:
+            questions: List of question texts
+            tags: Optional list of tags (required for caching)
+            
+        Returns:
+            numpy array of embeddings
+        """
+        logger.info("Generating embeddings...")
         logger.info(f"  Native prompts: {self.prefixes.use_native_prompts}, prefixes enabled: {self.prefixes.use_prefixes}")
         if self.prefixes.use_prefixes and self.prefixes.use_instruct_format:
             logger.info(f"  Classifier query format: Instruct + Query (E5-instruct)")
@@ -185,7 +200,27 @@ class UnifiedTagClassifierTrainer:
 
         logger.info(f"  Loading shared embedding model: {self.embedding_model_name}")
         self.embedding_model = get_shared_embedding_model(self.embedding_model_name)
+        embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
 
+        # Check if we can use caching
+        can_use_cache = (
+            self.use_embedding_cache and
+            self.cache_dir is not None and
+            tags is not None and
+            len(tags) == len(questions)
+        )
+
+        if can_use_cache:
+            return self._generate_embeddings_cached(questions, tags, embedding_dim)
+        else:
+            if self.use_embedding_cache and tags is None:
+                logger.warning("  Embedding cache disabled: tags not provided")
+            elif self.use_embedding_cache and self.cache_dir is None:
+                logger.warning("  Embedding cache disabled: cache_dir not set")
+            return self._generate_embeddings_fresh(questions)
+
+    def _generate_embeddings_fresh(self, questions: List[str]) -> np.ndarray:
+        """Generate embeddings without caching (original behavior)."""
         questions_to_encode = self.prefixes.format_classifier_queries_batch(questions)
 
         batch_size = 128 if self.device == 'cuda' else 32
@@ -198,6 +233,88 @@ class UnifiedTagClassifierTrainer:
             batch_size=batch_size
         )
 
+        logger.info(f"  Embeddings shape: {embeddings.shape}")
+        return embeddings
+
+    def _generate_embeddings_cached(
+        self,
+        questions: List[str],
+        tags: List[str],
+        embedding_dim: int
+    ) -> np.ndarray:
+        """Generate embeddings with caching support."""
+        cache_path = self.cache_dir / "embeddings" / "classifier"
+        cache = EmbeddingCacheManager(cache_path, "classifier")
+        
+        logger.info(f"  Cache location: {cache_path}")
+        
+        prefix_hash = get_prefix_config_hash(self.prefixes)
+        
+        # Validate cache metadata
+        if cache.exists():
+            if not cache.validate_metadata(
+                embedding_model=self.embedding_model_name,
+                embedding_dim=embedding_dim,
+                normalize_embeddings=self.normalize_embeddings,
+                prefix_config_hash=prefix_hash
+            ):
+                logger.info("  Cache invalidated (config changed), clearing...")
+                cache.clear()
+        
+        # Build fingerprint map
+        df = pd.DataFrame({'question': questions, 'tag': tags})
+        fp_map = cache.compute_fingerprints_batch(df)
+        
+        # Detect changes
+        changes = cache.detect_changes(set(fp_map.keys()))
+        
+        logger.info(f"  Embedding cache: {len(changes.unchanged)} cached, {len(changes.new)} new, {len(changes.deleted)} orphaned")
+        
+        if changes.cache_hit_rate > 0:
+            logger.info(f"  Cache hit rate: {changes.cache_hit_rate:.1%}")
+        
+        # Embed only new questions
+        if changes.new:
+            logger.info(f"  Encoding {len(changes.new)} new questions...")
+            
+            # Get questions in deterministic order
+            new_fps = sorted(changes.new)
+            new_questions = [fp_map[fp].question for fp in new_fps]
+            
+            # Encode
+            questions_to_encode = self.prefixes.format_classifier_queries_batch(new_questions)
+            batch_size = 128 if self.device == 'cuda' else 32
+            
+            new_embeddings = encode_queries(
+                self.embedding_model,
+                questions_to_encode,
+                use_native=self.prefixes.use_native_prompts,
+                normalize_embeddings=self.normalize_embeddings,
+                show_progress_bar=True,
+                batch_size=batch_size
+            )
+            
+            # Save to cache
+            cache.save_new_embeddings(set(new_fps), new_embeddings, fp_map)
+            
+            # Save/update metadata
+            cache.save_metadata(
+                embedding_model=self.embedding_model_name,
+                embedding_dim=embedding_dim,
+                normalize_embeddings=self.normalize_embeddings,
+                prefix_config_hash=prefix_hash
+            )
+        else:
+            logger.info("  All embeddings loaded from cache!")
+        
+        # Remove orphaned entries from index (not from storage, that's GC's job)
+        if changes.deleted:
+            cache.remove_from_index(changes.deleted)
+        
+        # Assemble final matrix in correct order
+        ordered_fps = [cache.compute_fingerprint(q, t) for q, t in zip(questions, tags)]
+        embeddings = cache.assemble_embeddings(ordered_fps, embedding_dim=embedding_dim)
+        
         logger.info(f"  Embeddings shape: {embeddings.shape}")
         return embeddings
 
@@ -247,7 +364,10 @@ class UnifiedTagClassifierTrainer:
                 f"Regenerate features with: python -m nlpcomponents.cli features --force"
             )
 
-        embeddings = self.generate_embeddings(df_train['question'].tolist())
+        embeddings = self.generate_embeddings(
+            df_train['question'].tolist(),
+            df_train['tag'].tolist()
+        )
         
         patterns_raw = self.compute_pattern_features_raw(
             df_train['question'].tolist(), tag_patterns, tags_sorted
@@ -659,6 +779,17 @@ def parse_args():
         default="query: ",
         help="Prefix for classifier queries when not using instruct format"
     )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Directory for embedding cache (default: models/../cache)"
+    )
+    parser.add_argument(
+        "--no-embedding-cache",
+        action="store_true",
+        help="Disable embedding cache (encode all questions fresh)"
+    )
     return parser.parse_args()
 
 def main():
@@ -692,11 +823,20 @@ def main():
             classifier_query_prefix=args.classifier_query_prefix,
         )
 
+        # Determine cache directory
+        cache_dir = args.cache_dir
+        if cache_dir is None:
+            cache_dir = models_dir.parent / "cache"
+        if not cache_dir.is_absolute():
+            cache_dir = ROOT_DIR / cache_dir
+
         trainer = UnifiedTagClassifierTrainer(
             embedding_model=args.embedding_model,
             contrastive_weight=args.contrastive_weight,
             features_dir=args.features_dir,
             prefixes=prefixes,
+            cache_dir=cache_dir,
+            use_embedding_cache=not args.no_embedding_cache,
         )
         
         df_train, df_eval = trainer.load_data(args.train_csv, args.eval_csv)
