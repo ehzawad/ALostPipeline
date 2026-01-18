@@ -5,7 +5,9 @@ import json
 from loguru import logger
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
 
 from .path_utils import (
     DATASETS_DIR,
@@ -53,8 +55,8 @@ class PreflightChecker:
         results = {}
         
         required = [
-            ("sts_train.csv", ('question', 'tag')),
-            ("sts_eval.csv", ('question', 'tag'))
+            ("question_tag.csv", ('question', 'tag')),
+            ("eval.csv", ('question', 'tag'))
         ]
         
         for filename, columns in required:
@@ -76,6 +78,88 @@ class PreflightChecker:
                 logger.error(f"  {filename}: error checking - {e}")
         
         return results
+
+    def check_and_deduplicate(
+        self,
+        auto_fix: bool = True
+    ) -> Dict[str, Any]:
+        logger.info("Checking for duplicate rows in question_tag.csv...")
+        
+        csv_path = self.datasets_dir / "question_tag.csv"
+        result: Dict[str, Any] = {
+            "status": "ok",
+            "file": str(csv_path),
+            "duplicates_found": 0,
+            "duplicate_examples": [],
+            "action_taken": None,
+            "original_rows": 0,
+            "final_rows": 0,
+        }
+        
+        if not csv_path.exists():
+            result["status"] = "file_missing"
+            logger.warning(f"  question_tag.csv: MISSING at {csv_path}")
+            return result
+        
+        try:
+            df = pd.read_csv(csv_path)
+            result["original_rows"] = len(df)
+            
+            if 'question' not in df.columns or 'tag' not in df.columns:
+                result["status"] = "invalid_columns"
+                logger.warning("  question_tag.csv: Missing required columns 'question' and/or 'tag'")
+                return result
+            
+            duplicates_mask = df.duplicated(subset=['question', 'tag'], keep='first')
+            num_duplicates = duplicates_mask.sum()
+            
+            result["duplicates_found"] = int(num_duplicates)
+            
+            if num_duplicates == 0:
+                result["status"] = "ok"
+                result["final_rows"] = len(df)
+                logger.info(f"  question_tag.csv: No duplicates found ({len(df)} unique rows)")
+                return result
+            
+            duplicate_rows = df[duplicates_mask].head(5)
+            result["duplicate_examples"] = [
+                {"question": row['question'][:50] + "..." if len(str(row['question'])) > 50 else row['question'], 
+                 "tag": row['tag']}
+                for _, row in duplicate_rows.iterrows()
+            ]
+            
+            logger.warning(f"  question_tag.csv: Found {num_duplicates} duplicate (question, tag) pairs!")
+            for i, example in enumerate(result["duplicate_examples"][:3]):
+                logger.warning(f"    Example {i+1}: tag='{example['tag']}', question='{example['question']}'")
+            
+            if auto_fix:
+                df_deduped = df.drop_duplicates(subset=['question', 'tag'], keep='first')
+                result["final_rows"] = len(df_deduped)
+                
+                backup_path = csv_path.with_suffix('.csv.bak')
+                df.to_csv(backup_path, index=False)
+                logger.info(f"  Created backup at: {backup_path}")
+                
+                df_deduped.to_csv(csv_path, index=False)
+                
+                result["status"] = "fixed"
+                result["action_taken"] = f"Removed {num_duplicates} duplicates, saved backup to {backup_path.name}"
+                logger.info(f"  [FIXED] Removed {num_duplicates} duplicates ({result['original_rows']} -> {result['final_rows']} rows)")
+                
+                logger.warning("  [IMPORTANT] Embedding caches should be cleared after de-duplication!")
+                logger.warning("  Run: python -m nlpcomponents.cli cache --clear")
+            else:
+                result["status"] = "duplicates_found"
+                result["final_rows"] = result["original_rows"]
+                result["action_taken"] = "No action (auto_fix=False)"
+                logger.warning(f"  De-duplication skipped. Run with auto_fix=True to fix.")
+            
+            return result
+            
+        except Exception as e:
+            result["status"] = f"error: {str(e)}"
+            logger.error(f"  Error checking duplicates: {e}")
+            return result
 
     def check_vocabulary(self) -> Dict[str, Any]:
         logger.info("Checking training vocabulary...")
@@ -320,12 +404,18 @@ class PreflightChecker:
         
         return results
     
-    def check_all(self) -> Dict[str, Dict]:
+    def check_all(self, auto_deduplicate: bool = True) -> Dict[str, Dict]:
         logger.info("="*60)
         logger.info("PREFLIGHT CHECK - Validating all artifacts")
         logger.info("="*60)
         
         results = {}
+        
+        try:
+            results["deduplication"] = self.check_and_deduplicate(auto_fix=auto_deduplicate)
+        except Exception as e:
+            logger.error(f"Deduplication check failed: {e}")
+            results["deduplication"] = {"error": str(e)}
         
         try:
             results["datasets"] = self.check_datasets()
@@ -381,9 +471,20 @@ class PreflightChecker:
         logger.info("="*60)
         return results
     
-    def ensure_inference_ready(self, verbose: bool = True) -> bool:
+    def ensure_inference_ready(self, verbose: bool = True, auto_deduplicate: bool = True) -> bool:
         all_ready = True
         issues: List[str] = []
+        
+        try:
+            dedup_result = self.check_and_deduplicate(auto_fix=auto_deduplicate)
+            if dedup_result.get("status") == "duplicates_found":
+                all_ready = False
+                issues.append(f"Duplicates: {dedup_result.get('duplicates_found')} duplicate rows found")
+            elif dedup_result.get("status") == "fixed":
+                if verbose:
+                    logger.info(f"  [FIXED] Removed {dedup_result.get('duplicates_found')} duplicate rows")
+        except Exception as e:
+            logger.warning(f"Deduplication check error: {e}")
         
         try:
             datasets = self.check_datasets()

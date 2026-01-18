@@ -3,6 +3,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List
 
+from ..utils.json_utils import json_default
+
 class STSFeatureAnalyzer:
 
     def __init__(self, features_path: Path):
@@ -250,7 +252,7 @@ class STSFeatureAnalyzer:
     def save_analysis(self, analysis: Dict, output_path: Path) -> None:
         print(f"\nSaving overlap analysis to {output_path}")
         with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(analysis, f, ensure_ascii=False, indent=2)
+            json.dump(analysis, f, ensure_ascii=False, indent=2, default=json_default)
         print("Saved successfully!")
 
     def print_summary(self, analysis: Dict) -> None:

@@ -71,7 +71,7 @@ def parse_args():
     parser.add_argument(
         "--train-csv",
         type=Path,
-        default=Path("nlpcomponents/datasets/sts_train.csv"),
+        default=Path("nlpcomponents/datasets/question_tag.csv"),
         help="Path to training CSV"
     )
     parser.add_argument(
@@ -231,7 +231,7 @@ def main():
         print(f"\nNext steps:")
         print(f"   1. Review {manual_ngrams_path} and customize if needed")
         print(f"   2. Train classifier with: python -m nlpcomponents.cli train-classifier --force")
-        print(f"   3. Evaluate: python -m nlpcomponents.cli eval --data nlpcomponents/datasets/sts_eval.csv --top-k 1")
+        print(f"   3. Evaluate: python -m nlpcomponents.cli eval --data nlpcomponents/datasets/eval.csv --top-k 1")
 
         print("\n" + "="*70)
 

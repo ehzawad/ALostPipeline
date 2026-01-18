@@ -317,7 +317,6 @@ def cmd_interactive(args: argparse.Namespace):
             print(f"Error: {exc}")
 
 def _get_cache_managers(config: NLPPipelineConfig):
-    """Get cache managers for both classifier and STS."""
     cache_base = config.output.cache_dir / "embeddings"
     return {
         "classifier": EmbeddingCacheManager(cache_base / "classifier", "classifier"),
@@ -326,7 +325,6 @@ def _get_cache_managers(config: NLPPipelineConfig):
 
 
 def cmd_cache_stats(args: argparse.Namespace):
-    """Show embedding cache statistics."""
     config = _load_config(args)
     managers = _get_cache_managers(config)
     
@@ -377,11 +375,9 @@ def cmd_cache_stats(args: argparse.Namespace):
 
 
 def cmd_cache_clear(args: argparse.Namespace):
-    """Clear embedding cache."""
     config = _load_config(args)
     managers = _get_cache_managers(config)
     
-    # Determine which caches to clear
     targets = []
     if args.classifier:
         targets.append("classifier")
@@ -410,11 +406,9 @@ def cmd_cache_clear(args: argparse.Namespace):
 
 
 def cmd_cache_gc(args: argparse.Namespace):
-    """Garbage collect orphaned embeddings."""
     config = _load_config(args)
     managers = _get_cache_managers(config)
     
-    # Load current training data to get valid fingerprints
     train_csv = config.dataset.train_csv
     if not train_csv.exists():
         print(f"Training data not found: {train_csv}")
@@ -425,7 +419,6 @@ def cmd_cache_gc(args: argparse.Namespace):
     df = pd.read_csv(train_csv)
     print(f"  {len(df)} questions loaded")
     
-    # Compute fingerprints for current data
     current_fps = set()
     for _, row in df.iterrows():
         question = str(row['question']) if pd.notna(row['question']) else ""
@@ -435,7 +428,6 @@ def cmd_cache_gc(args: argparse.Namespace):
     
     print(f"  {len(current_fps)} unique fingerprints")
     
-    # Determine which caches to GC
     targets = []
     if args.classifier:
         targets.append("classifier")
@@ -459,7 +451,6 @@ def cmd_cache_gc(args: argparse.Namespace):
         print(f"  Before: {stats_before.total_entries} entries, {stats_before.total_size_mb:.2f} MB")
         
         if args.dry_run:
-            # Just detect what would be removed
             changes = manager.detect_changes(current_fps)
             print(f"  Would remove: {len(changes.deleted)} orphaned entries")
         else:
@@ -544,7 +535,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_int.add_argument("--dry-run", action="store_true")
     p_int.set_defaults(func=cmd_interactive)
 
-    # Cache management commands
     p_cache_stats = sub.add_parser("cache-stats", help="Show embedding cache statistics")
     p_cache_stats.add_argument("--verbose", "-v", action="store_true", help="Show detailed per-tag breakdown")
     p_cache_stats.add_argument("--json", action="store_true", help="Output as JSON")

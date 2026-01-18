@@ -8,7 +8,6 @@ from ..config import NLPPipelineConfig
 from ..semantic import SemanticSearchEngine
 from ..classifier import TagClassifier
 from ..ranker import ConfidenceRanker
-from ..cache.model_cache import get_shared_embedding_model, encode_queries
 
 class NLPPipeline:
 
@@ -24,7 +23,9 @@ class NLPPipeline:
         self.classifier = TagClassifier(self.config.classifier, prefixes_config=self.config.prefixes)
         self.ranker = ConfidenceRanker(
             confidence_threshold=self.config.ranker.confidence_threshold,
-            fallback_answer=self.config.ranker.abstain_answer,
+            abstain_answer=self.config.ranker.abstain_answer,
+            fallback_answer=self.config.ranker.fallback_answer or "",
+            enable_sts_reranking=self.config.ranker.enable_sts_reranking,
         )
         self._initialized = False
 
@@ -51,24 +52,9 @@ class NLPPipeline:
         fusion_top_k = fusion_top_k or self.config.fusion_top_k
         start_time = time.time()
 
-        shared_embedding = None
-        shared_embedding_used = False
-        if self._can_share_embedding():
-            model = get_shared_embedding_model(self.config.semantic.embedding_model)
-            question_prefixed = self.config.prefixes.format_sts_query(question)
-            shared_embedding = encode_queries(
-                model,
-                [question_prefixed],
-                use_native=self.config.prefixes.use_native_prompts,
-                normalize_embeddings=self.config.semantic.normalize_embeddings,
-                show_progress_bar=False
-            )[0]
-            shared_embedding_used = True
-
         sts_state = self.semantic.search(
             question,
-            top_k=self.config.semantic.top_k,
-            precomputed_embedding=shared_embedding
+            top_k=self.config.semantic.top_k
         )
 
         if sts_state.is_ood:
@@ -77,8 +63,8 @@ class NLPPipeline:
             irrelevant_result = {
                 "tag": None,
                 "answer": self.config.ranker.abstain_answer,
+                "confidence": 0.0,
                 "final_score": 0.0,
-                "original_score": 0.0,
                 "source": "density_ood",
                 "density_ood": True,
             }
@@ -107,7 +93,6 @@ class NLPPipeline:
                     "ranker": {"density_ood": True},
                     "latency_ms": round(total_time, 2),
                     "fusion_top_k": fusion_top_k,
-                    "shared_embedding_used": shared_embedding_used,
                     "density_score": sts_state.density_score,
                     "density_threshold": self.config.semantic.density_threshold,
                     "density_details": sts_state.density_details,
@@ -116,8 +101,7 @@ class NLPPipeline:
 
         clf_state = self.classifier.predict(
             question,
-            top_k=self.config.classifier.top_k,
-            precomputed_embedding=shared_embedding
+            top_k=self.config.classifier.top_k
         )
 
         if clf_state.is_ood:
@@ -126,8 +110,8 @@ class NLPPipeline:
             irrelevant_result = {
                 "tag": None,
                 "answer": self.config.ranker.abstain_answer,
+                "confidence": 0.0,
                 "final_score": 0.0,
-                "original_score": 0.0,
                 "source": "entropy_ood",
                 "entropy_ood": True,
             }
@@ -155,7 +139,6 @@ class NLPPipeline:
                     "ranker": {"entropy_ood": True},
                     "latency_ms": round(total_time, 2),
                     "fusion_top_k": fusion_top_k,
-                    "shared_embedding_used": shared_embedding_used,
                     "entropy": clf_state.entropy,
                     "normalized_entropy": clf_state.normalized_entropy,
                     "entropy_threshold": self.config.classifier.entropy_threshold,
@@ -212,7 +195,6 @@ class NLPPipeline:
                 "ranker": telemetry.__dict__,
                 "latency_ms": round(total_time, 2),
                 "fusion_top_k": fusion_top_k,
-                "shared_embedding_used": shared_embedding_used,
                 "density_score": sts_state.density_score,
                 "density_threshold": self.config.semantic.density_threshold if self.config.semantic.enable_density_ood else None,
                 "entropy": clf_state.entropy,
@@ -220,18 +202,3 @@ class NLPPipeline:
                 "entropy_threshold": self.config.classifier.entropy_threshold if self.config.classifier.enable_entropy_ood else None,
             }
         }
-
-    def _can_share_embedding(self) -> bool:
-        same_model = self.config.semantic.embedding_model == self.config.classifier.embedding_model
-        
-        same_normalization = (
-            self.config.semantic.normalize_embeddings == 
-            self.config.classifier.normalize_embeddings
-        )
-        
-        test_query = "test query"
-        sts_formatted = self.config.prefixes.format_sts_query(test_query)
-        clf_formatted = self.config.prefixes.format_classifier_query(test_query)
-        same_prefix = (sts_formatted == clf_formatted)
-        
-        return same_model and same_normalization and same_prefix

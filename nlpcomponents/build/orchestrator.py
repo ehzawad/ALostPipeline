@@ -100,28 +100,28 @@ class BuildOrchestrator:
             "training_vocabulary.json": {
                 "type": "feature",
                 "path": self.config.output.features_dir / "training_vocabulary.json",
-                "dependencies": ["sts_train.csv"],
+                "dependencies": ["question_tag.csv"],
                 "dependents": [],
                 "companion_files": []
             },
             "manual_ngrams.json": {
                 "type": "feature",
                 "path": self.config.output.features_dir / "manual_ngrams.json",
-                "dependencies": ["sts_train.csv"],
+                "dependencies": ["question_tag.csv"],
                 "dependents": ["unified_tag_classifier.pth"],
                 "companion_files": []
             },
             "unified_tag_classifier.pth": {
                 "type": "model",
                 "path": self.config.output.classifier_dir / "unified_tag_classifier.pth",
-                "dependencies": ["sts_train.csv", "sts_eval.csv", "manual_ngrams.json"],
+                "dependencies": ["question_tag.csv", "eval.csv", "manual_ngrams.json"],
                 "dependents": [],
                 "companion_files": ["unified_tag_classifier_metadata.json"]
             },
             "faiss_index_global.index": {
                 "type": "model",
                 "path": self.config.output.semantic_dir / "faiss_index_global.index",
-                "dependencies": ["sts_train.csv"],
+                "dependencies": ["question_tag.csv"],
                 "dependents": [],
                 "companion_files": ["sts_metadata.json", "sts_embeddings.npy", "question_mapping.csv"]
             }
@@ -129,10 +129,10 @@ class BuildOrchestrator:
 
     def _get_current_dataset_fingerprints(self) -> Dict[str, str]:
         current_fps = {
-            "sts_train.csv": self._compute_dataset_fingerprint(
+            "question_tag.csv": self._compute_dataset_fingerprint(
                 self.config.dataset.train_csv, columns=('question', 'tag')
             ),
-            "sts_eval.csv": self._compute_dataset_fingerprint(
+            "eval.csv": self._compute_dataset_fingerprint(
                 self.config.dataset.eval_csv, columns=('question', 'tag')
             )
         }
@@ -227,7 +227,7 @@ class BuildOrchestrator:
                 if not stored_fp:
                     return True
                     
-                if stored_fp != current_fps["sts_train.csv"]:
+                if stored_fp != current_fps["question_tag.csv"]:
                     logger.debug(f"  {artifact_name}: dataset changed")
                     return True
                 return False
@@ -244,17 +244,23 @@ class BuildOrchestrator:
                     metadata = json.load(f)
                 deps = metadata.get("dependencies", {})
 
+                # Check training dataset fingerprint
                 stored_dataset_fp = deps.get("dataset", {}).get("fingerprint")
-                if stored_dataset_fp != current_fps["sts_train.csv"]:
+                if stored_dataset_fp != current_fps["question_tag.csv"]:
                     logger.debug(f"  {artifact_name}: training dataset changed")
                     return True
 
+                # Check eval dataset fingerprint (Bug 7 fix: catch None mismatches)
                 stored_eval_fp = deps.get("eval_dataset", {}).get("fingerprint")
-                current_eval_fp = current_fps.get("sts_eval.csv")
-                if stored_eval_fp and current_eval_fp and stored_eval_fp != current_eval_fp:
-                    logger.debug(f"  {artifact_name}: eval dataset changed")
+                current_eval_fp = current_fps.get("eval.csv")
+                if stored_eval_fp != current_eval_fp:
+                    if stored_eval_fp is None or current_eval_fp is None:
+                        logger.debug(f"  {artifact_name}: eval dataset fingerprint missing (stored={stored_eval_fp is not None}, current={current_eval_fp is not None})")
+                    else:
+                        logger.debug(f"  {artifact_name}: eval dataset changed")
                     return True
 
+                # Check ngram fingerprint
                 current_ngram_fp = self._compute_ngram_fingerprint(
                     self.config.output.features_dir / "manual_ngrams.json"
                 )
@@ -262,6 +268,27 @@ class BuildOrchestrator:
                 if stored_ngram_fp != current_ngram_fp:
                     logger.debug(f"  {artifact_name}: n-grams changed")
                     return True
+
+                # Check embedding model (Bug 3 fix: track hyperparameters)
+                stored_embedding_model = metadata.get("embedding_model")
+                if stored_embedding_model != self.config.classifier.embedding_model:
+                    logger.debug(f"  {artifact_name}: embedding model changed ({stored_embedding_model} -> {self.config.classifier.embedding_model})")
+                    return True
+
+                # Check normalization setting
+                stored_normalize = metadata.get("normalize_embeddings")
+                if stored_normalize is not None and stored_normalize != self.config.classifier.normalize_embeddings:
+                    logger.debug(f"  {artifact_name}: normalization setting changed")
+                    return True
+
+                # Check prefix config
+                from ..cache.embedding_cache import get_prefix_config_hash
+                current_prefix_hash = get_prefix_config_hash(self.config.prefixes)
+                stored_prefix_hash = metadata.get("prefix_config_hash")
+                if stored_prefix_hash is not None and stored_prefix_hash != current_prefix_hash:
+                    logger.debug(f"  {artifact_name}: prefix config changed")
+                    return True
+
                 return False
             except Exception as e:
                 logger.debug(f"  {artifact_name}: error checking dependencies, assuming changed: {e}")
@@ -276,9 +303,39 @@ class BuildOrchestrator:
                     metadata = json.load(f)
                 deps = metadata.get("dependencies", {})
 
+                # Check training dataset fingerprint
                 stored_dataset_fp = deps.get("dataset", {}).get("fingerprint")
-                if stored_dataset_fp != current_fps["sts_train.csv"]:
+                if stored_dataset_fp != current_fps["question_tag.csv"]:
                     logger.debug(f"  {artifact_name}: training dataset changed")
+                    return True
+
+                # Check embedding model (Bug 3 fix: track hyperparameters)
+                stored_embedding_model = metadata.get("embedding_model")
+                if stored_embedding_model != self.config.semantic.embedding_model:
+                    logger.debug(f"  {artifact_name}: embedding model changed ({stored_embedding_model} -> {self.config.semantic.embedding_model})")
+                    return True
+
+                # Check normalization setting
+                stored_normalize = metadata.get("normalize_embeddings")
+                if stored_normalize is not None and stored_normalize != self.config.semantic.normalize_embeddings:
+                    logger.debug(f"  {artifact_name}: normalization setting changed")
+                    return True
+
+                # Check prefix config for STS
+                from ..cache.embedding_cache import get_prefix_config_hash
+                current_prefix_hash = get_prefix_config_hash(self.config.prefixes)
+                # STS metadata stores individual prefix fields, not hash - check those
+                stored_use_native = metadata.get("use_native_prompts")
+                stored_use_prefixes = metadata.get("use_prefixes")
+                stored_use_instruct = metadata.get("use_instruct_format")
+                if stored_use_native is not None and stored_use_native != self.config.prefixes.use_native_prompts:
+                    logger.debug(f"  {artifact_name}: use_native_prompts changed")
+                    return True
+                if stored_use_prefixes is not None and stored_use_prefixes != self.config.prefixes.use_prefixes:
+                    logger.debug(f"  {artifact_name}: use_prefixes changed")
+                    return True
+                if stored_use_instruct is not None and stored_use_instruct != self.config.prefixes.use_instruct_format:
+                    logger.debug(f"  {artifact_name}: use_instruct_format changed")
                     return True
 
                 return False
@@ -366,7 +423,7 @@ class BuildOrchestrator:
         lines.append("=" * 60)
 
         lines.append("\nDATASETS:")
-        for name in ["sts_train.csv", "sts_eval.csv"]:
+        for name in ["question_tag.csv", "eval.csv"]:
             info = status.get(name, {})
             s = info.get("status", "unknown")
             fp = info.get("fingerprint", "")
@@ -448,8 +505,8 @@ class BuildOrchestrator:
         results = {}
 
         ds_map = {
-            "sts_train.csv": self.config.dataset.train_csv,
-            "sts_eval.csv": self.config.dataset.eval_csv,
+            "question_tag.csv": self.config.dataset.train_csv,
+            "eval.csv": self.config.dataset.eval_csv,
         }
         for name, fp in current_fps.items():
             path = ds_map.get(name)

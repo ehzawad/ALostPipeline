@@ -18,6 +18,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from nlpcomponents.build.fingerprint import compute_dataset_fingerprint
 from nlpcomponents.utils.ngram_utils import extract_ngram_words_list
+from nlpcomponents.utils.json_utils import json_default
 
 class VocabularyBuilder:
 
@@ -117,7 +118,7 @@ class VocabularyBuilder:
                 "dependencies": {
                     "dataset": {
                         "fingerprint": dataset_fp,
-                        "file": "sts_train.csv",
+                        "file": "question_tag.csv",
                         "num_samples": len(df),
                         "num_tags": df['tag'].nunique()
                     }
@@ -164,7 +165,7 @@ def build_vocabulary(
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(vocab_data, f, ensure_ascii=False, indent=2)
+            json.dump(vocab_data, f, ensure_ascii=False, indent=2, default=json_default)
 
         logger.info(f"\nVocabulary saved to {output_path}")
 
@@ -190,8 +191,8 @@ def main():
     parser.add_argument(
         "--train-csv",
         type=Path,
-        default=ROOT_DIR / "nlpcomponents" / "datasets" / "sts_train.csv",
-        help="Path to sts_train.csv"
+        default=ROOT_DIR / "nlpcomponents" / "datasets" / "question_tag.csv",
+        help="Path to question_tag.csv"
     )
     parser.add_argument(
         "--output",

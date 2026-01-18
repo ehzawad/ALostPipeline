@@ -12,12 +12,12 @@ DEFAULT_E5_INSTRUCT_TASK = "Given a user question, retrieve similar questions, a
 
 @dataclass
 class DatasetConfig:
-    train_csv: Path = Path("datasets/sts_train.csv")
-    eval_csv: Path = Path("datasets/sts_eval.csv")
+    train_csv: Path = Path("datasets/question_tag.csv")
+    eval_csv: Path = Path("datasets/eval.csv")
 
     def __post_init__(self):
-        self.train_csv = _as_path(self.train_csv, Path("datasets/sts_train.csv"))
-        self.eval_csv = _as_path(self.eval_csv, Path("datasets/sts_eval.csv"))
+        self.train_csv = _as_path(self.train_csv, Path("datasets/question_tag.csv"))
+        self.eval_csv = _as_path(self.eval_csv, Path("datasets/eval.csv"))
 
 
 @dataclass
@@ -169,6 +169,7 @@ class RankerConfig:
     fallback_answer: Optional[str] = None
     vocab_file: Optional[Path] = None
     ngrams_file: Optional[Path] = None
+    enable_sts_reranking: bool = True  # When True, if STS agrees with classifier's 2nd choice, prefer the 2nd choice
 
 
 @dataclass

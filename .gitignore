@@ -31,6 +31,10 @@ nlpcomponents/datasets/features/
 # Generated model artifacts - entire folders
 nlpcomponents/models/
 
+# Embedding cache - generated during training
+nlpcomponents/cache/embeddings/
+cache/
+
 # Cache files
 *.cache
 .cache/
@@ -39,19 +43,36 @@ nlpcomponents/models/
 logs/
 results/
 
-# Build backups
+# Build artifacts
 .backups/
+.build.lock
+*.bak
+
+# Temporary files
+*.tmp
+*.temp
 
 # OS
 .DS_Store
+Thumbs.db
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+.cursor/
 
 # Agent files
 CLAUDE.md
 AGENTS.md
 .claude/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment
+.env
+.env.local
+*.env

@@ -24,7 +24,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from nlpcomponents.cache.model_cache import get_shared_embedding_model, get_default_device, encode_queries
-from nlpcomponents.cache.embedding_cache import EmbeddingCacheManager, get_prefix_config_hash
+from nlpcomponents.cache.embedding_cache import EmbeddingCacheManager, get_prefix_config_hash, get_classifier_prefix_hash
 from nlpcomponents.build.fingerprint import compute_fingerprint
 from nlpcomponents.build.fingerprint import compute_dataset_fingerprint, compute_ngram_fingerprint
 from nlpcomponents.config import EmbeddingPrefixConfig, DEFAULT_E5_INSTRUCT_TASK, DEFAULT_EMBEDDING_MODEL
@@ -32,6 +32,7 @@ from nlpcomponents.inference import UnifiedTagClassifier, SupConLoss
 from nlpcomponents.utils.constants import NGRAM_TYPES
 from nlpcomponents.utils.ngram_utils import extract_ngram_words
 from nlpcomponents.utils.errors import format_missing_artifact_error
+from nlpcomponents.utils.json_utils import json_default
 
 class TagDataset(Dataset):
 
@@ -180,16 +181,6 @@ class UnifiedTagClassifierTrainer:
         return (features - mean) / std
 
     def generate_embeddings(self, questions: List[str], tags: Optional[List[str]] = None) -> np.ndarray:
-        """
-        Generate embeddings with optional caching support.
-        
-        Args:
-            questions: List of question texts
-            tags: Optional list of tags (required for caching)
-            
-        Returns:
-            numpy array of embeddings
-        """
         logger.info("Generating embeddings...")
         logger.info(f"  Native prompts: {self.prefixes.use_native_prompts}, prefixes enabled: {self.prefixes.use_prefixes}")
         if self.prefixes.use_prefixes and self.prefixes.use_instruct_format:
@@ -202,7 +193,6 @@ class UnifiedTagClassifierTrainer:
         self.embedding_model = get_shared_embedding_model(self.embedding_model_name)
         embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
 
-        # Check if we can use caching
         can_use_cache = (
             self.use_embedding_cache and
             self.cache_dir is not None and
@@ -220,7 +210,6 @@ class UnifiedTagClassifierTrainer:
             return self._generate_embeddings_fresh(questions)
 
     def _generate_embeddings_fresh(self, questions: List[str]) -> np.ndarray:
-        """Generate embeddings without caching (original behavior)."""
         questions_to_encode = self.prefixes.format_classifier_queries_batch(questions)
 
         batch_size = 128 if self.device == 'cuda' else 32
@@ -242,15 +231,14 @@ class UnifiedTagClassifierTrainer:
         tags: List[str],
         embedding_dim: int
     ) -> np.ndarray:
-        """Generate embeddings with caching support."""
         cache_path = self.cache_dir / "embeddings" / "classifier"
         cache = EmbeddingCacheManager(cache_path, "classifier")
         
         logger.info(f"  Cache location: {cache_path}")
         
-        prefix_hash = get_prefix_config_hash(self.prefixes)
+        # Use classifier-specific hash to avoid invalidation when STS-only settings change
+        prefix_hash = get_classifier_prefix_hash(self.prefixes)
         
-        # Validate cache metadata
         if cache.exists():
             if not cache.validate_metadata(
                 embedding_model=self.embedding_model_name,
@@ -261,11 +249,9 @@ class UnifiedTagClassifierTrainer:
                 logger.info("  Cache invalidated (config changed), clearing...")
                 cache.clear()
         
-        # Build fingerprint map
         df = pd.DataFrame({'question': questions, 'tag': tags})
         fp_map = cache.compute_fingerprints_batch(df)
         
-        # Detect changes
         changes = cache.detect_changes(set(fp_map.keys()))
         
         logger.info(f"  Embedding cache: {len(changes.unchanged)} cached, {len(changes.new)} new, {len(changes.deleted)} orphaned")
@@ -273,15 +259,12 @@ class UnifiedTagClassifierTrainer:
         if changes.cache_hit_rate > 0:
             logger.info(f"  Cache hit rate: {changes.cache_hit_rate:.1%}")
         
-        # Embed only new questions
         if changes.new:
             logger.info(f"  Encoding {len(changes.new)} new questions...")
             
-            # Get questions in deterministic order
             new_fps = sorted(changes.new)
             new_questions = [fp_map[fp].question for fp in new_fps]
             
-            # Encode
             questions_to_encode = self.prefixes.format_classifier_queries_batch(new_questions)
             batch_size = 128 if self.device == 'cuda' else 32
             
@@ -294,24 +277,21 @@ class UnifiedTagClassifierTrainer:
                 batch_size=batch_size
             )
             
-            # Save to cache
-            cache.save_new_embeddings(set(new_fps), new_embeddings, fp_map)
+            cache.save_new_embeddings(new_fps, new_embeddings, fp_map)
             
-            # Save/update metadata
-            cache.save_metadata(
-                embedding_model=self.embedding_model_name,
-                embedding_dim=embedding_dim,
-                normalize_embeddings=self.normalize_embeddings,
-                prefix_config_hash=prefix_hash
-            )
         else:
             logger.info("  All embeddings loaded from cache!")
         
-        # Remove orphaned entries from index (not from storage, that's GC's job)
         if changes.deleted:
             cache.remove_from_index(changes.deleted)
         
-        # Assemble final matrix in correct order
+        cache.save_metadata(
+            embedding_model=self.embedding_model_name,
+            embedding_dim=embedding_dim,
+            normalize_embeddings=self.normalize_embeddings,
+            prefix_config_hash=prefix_hash
+        )
+        
         ordered_fps = [cache.compute_fingerprint(q, t) for q, t in zip(questions, tags)]
         embeddings = cache.assemble_embeddings(ordered_fps, embedding_dim=embedding_dim)
         
@@ -647,6 +627,9 @@ class UnifiedTagClassifierTrainer:
         file_size_mb = model_file.stat().st_size / (1024 * 1024)
         logger.info(f"  Model saved: {model_file.name} ({file_size_mb:.2f} MB)")
 
+        # Compute classifier-specific prefix hash for dependency tracking
+        prefix_config_hash = get_classifier_prefix_hash(self.prefixes)
+        
         metadata = {
             'contrastive_weight': self.contrastive_weight,
             'embedding_model': self.embedding_model_name,
@@ -660,12 +643,13 @@ class UnifiedTagClassifierTrainer:
             'fingerprint': fingerprint,
             'dependencies': dependencies or {},
             'normalize_embeddings': self.normalize_embeddings,
+            'prefix_config_hash': prefix_config_hash,
             **self.prefixes.get_metadata()
         }
 
         metadata_file = output_dir / "unified_tag_classifier_metadata.json"
         with open(metadata_file, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2, ensure_ascii=False)
+            json.dump(metadata, f, indent=2, ensure_ascii=False, default=json_default)
 
         logger.info(f"  Metadata saved: {metadata_file.name}")
         logger.info(f"\n  All artifacts saved to: {output_dir}")
@@ -722,13 +706,13 @@ def parse_args():
     parser.add_argument(
         "--train-csv",
         type=Path,
-        default=Path("nlpcomponents/datasets/sts_train.csv"),
+        default=Path("nlpcomponents/datasets/question_tag.csv"),
         help="Path to training CSV"
     )
     parser.add_argument(
         "--eval-csv",
         type=Path,
-        default=Path("nlpcomponents/datasets/sts_eval.csv"),
+        default=Path("nlpcomponents/datasets/eval.csv"),
         help="Path to eval CSV"
     )
     parser.add_argument(
@@ -823,7 +807,6 @@ def main():
             classifier_query_prefix=args.classifier_query_prefix,
         )
 
-        # Determine cache directory
         cache_dir = args.cache_dir
         if cache_dir is None:
             cache_dir = models_dir.parent / "cache"
@@ -947,7 +930,7 @@ def main():
             print(f"  Contrastive loss: Enabled (weight={args.contrastive_weight})")
         print(f"\nModel saved to: {models_dir / 'unified_tag_classifier.pth'}")
         print(f"\nTo evaluate:")
-        print(f"   python -m nlpcomponents.cli eval --data nlpcomponents/datasets/sts_eval.csv --top-k 1")
+        print(f"   python -m nlpcomponents.cli eval --data nlpcomponents/datasets/eval.csv --top-k 1")
         print("\n" + "=" * 80)
 
     except Exception as e:

@@ -30,8 +30,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--data",
-        default="nlpcomponents/datasets/sts_eval.csv",
-        help="CSV file with columns: question, tag (default: nlpcomponents/datasets/sts_eval.csv)"
+        default="nlpcomponents/datasets/eval.csv",
+        help="CSV file with columns: question, tag (default: nlpcomponents/datasets/eval.csv)"
     )
     parser.add_argument(
         "--top-k",

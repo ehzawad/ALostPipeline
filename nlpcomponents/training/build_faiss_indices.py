@@ -20,10 +20,11 @@ if str(ROOT_DIR) not in sys.path:
 from nlpcomponents.config import EmbeddingPrefixConfig, DEFAULT_E5_INSTRUCT_TASK, DEFAULT_EMBEDDING_MODEL
 from nlpcomponents.build.fingerprint import compute_fingerprint
 from nlpcomponents.cache.model_cache import get_default_device
-from nlpcomponents.cache.embedding_cache import EmbeddingCacheManager, get_prefix_config_hash
+from nlpcomponents.cache.embedding_cache import EmbeddingCacheManager, get_prefix_config_hash, get_sts_prefix_hash
 from nlpcomponents.build.fingerprint import compute_dataset_fingerprint, compute_classifier_fingerprint
 from nlpcomponents.utils.faiss_utils import get_faiss, is_gpu_available, index_cpu_to_gpu, index_gpu_to_cpu, get_device_string
 from nlpcomponents.utils.path_utils import DATASETS_DIR, SEMANTIC_MODELS_DIR, CLASSIFIER_MODELS_DIR
+from nlpcomponents.utils.json_utils import json_default
 
 if TYPE_CHECKING:
     import faiss
@@ -63,16 +64,6 @@ class STSTrainer:
         return df
 
     def generate_embeddings(self, questions, tags: Optional[list] = None):
-        """
-        Generate embeddings with optional caching support.
-        
-        Args:
-            questions: List of question texts
-            tags: Optional list of tags (required for caching)
-            
-        Returns:
-            numpy array of embeddings
-        """
         logger.info("\nGenerating embeddings...")
         logger.info(f"  Model: {self.embedding_model_name}")
         logger.info(f"  Questions: {len(questions)}")
@@ -92,7 +83,6 @@ class STSTrainer:
         self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
         logger.info(f"  [OK] Model loaded successfully on {device}")
         
-        # Check if we can use caching
         can_use_cache = (
             self.use_embedding_cache and
             self.cache_dir is not None and
@@ -110,7 +100,6 @@ class STSTrainer:
             return self._generate_raw_embeddings(questions, device)
     
     def _generate_raw_embeddings(self, questions, device: str):
-        """Generate embeddings without caching (original behavior)."""
         from nlpcomponents.cache.model_cache import encode_documents
         
         questions_to_encode = self.prefixes.format_sts_passages_batch(questions)
@@ -134,7 +123,6 @@ class STSTrainer:
         return embeddings
 
     def _generate_embeddings_cached(self, questions, tags, device: str):
-        """Generate embeddings with caching support."""
         from nlpcomponents.cache.model_cache import encode_documents
         
         cache_path = self.cache_dir / "embeddings" / "sts"
@@ -142,10 +130,10 @@ class STSTrainer:
         
         logger.info(f"  Cache location: {cache_path}")
         
-        prefix_hash = get_prefix_config_hash(self.prefixes)
+        # Use STS-specific hash to avoid invalidation when classifier-only settings change
+        prefix_hash = get_sts_prefix_hash(self.prefixes)
         embedding_dim = self.embedding_dim
         
-        # Validate cache metadata
         if cache.exists():
             if not cache.validate_metadata(
                 embedding_model=self.embedding_model_name,
@@ -156,11 +144,9 @@ class STSTrainer:
                 logger.info("  Cache invalidated (config changed), clearing...")
                 cache.clear()
         
-        # Build fingerprint map
         df = pd.DataFrame({'question': questions, 'tag': tags})
         fp_map = cache.compute_fingerprints_batch(df)
         
-        # Detect changes
         changes = cache.detect_changes(set(fp_map.keys()))
         
         logger.info(f"  Embedding cache: {len(changes.unchanged)} cached, {len(changes.new)} new, {len(changes.deleted)} orphaned")
@@ -168,15 +154,12 @@ class STSTrainer:
         if changes.cache_hit_rate > 0:
             logger.info(f"  Cache hit rate: {changes.cache_hit_rate:.1%}")
         
-        # Embed only new questions
         if changes.new:
             logger.info(f"  Encoding {len(changes.new)} new questions...")
             
-            # Get questions in deterministic order
             new_fps = sorted(changes.new)
             new_questions = [fp_map[fp].question for fp in new_fps]
             
-            # Encode (using passage format for FAISS)
             questions_to_encode = self.prefixes.format_sts_passages_batch(new_questions)
             batch_size = 128 if device == 'cuda' else 32
             
@@ -189,24 +172,20 @@ class STSTrainer:
                 batch_size=batch_size
             )
             
-            # Save to cache
-            cache.save_new_embeddings(set(new_fps), new_embeddings, fp_map)
-            
-            # Save/update metadata
-            cache.save_metadata(
-                embedding_model=self.embedding_model_name,
-                embedding_dim=embedding_dim,
-                normalize_embeddings=self.normalize_embeddings,
-                prefix_config_hash=prefix_hash
-            )
+            cache.save_new_embeddings(new_fps, new_embeddings, fp_map)
         else:
             logger.info("  All embeddings loaded from cache!")
         
-        # Remove orphaned entries from index
+        cache.save_metadata(
+            embedding_model=self.embedding_model_name,
+            embedding_dim=embedding_dim,
+            normalize_embeddings=self.normalize_embeddings,
+            prefix_config_hash=prefix_hash
+        )
+        
         if changes.deleted:
             cache.remove_from_index(changes.deleted)
         
-        # Assemble final matrix in correct order
         ordered_fps = [cache.compute_fingerprint(q, t) for q, t in zip(questions, tags)]
         embeddings = cache.assemble_embeddings(ordered_fps, embedding_dim=embedding_dim)
         
@@ -231,15 +210,13 @@ class STSTrainer:
         index_global = faiss_mod.IndexFlatIP(self.embedding_dim)
         
         gpu_used = False
+        gpu_index = None
         if use_gpu and is_gpu_available():
             try:
                 gpu_index, moved = index_cpu_to_gpu(index_global)
                 if moved:
                     gpu_index.add(embeddings_f32)
                     index_global = index_gpu_to_cpu(gpu_index)
-                    del gpu_index
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
                     gpu_used = True
                     logger.info("  [GPU] Index built on GPU, converted to CPU for saving")
                 else:
@@ -247,6 +224,12 @@ class STSTrainer:
             except Exception as e:
                 logger.warning(f"  GPU index building failed, falling back to CPU: {e}")
                 index_global.add(embeddings_f32)
+            finally:
+                # Always clean up GPU resources, even on failure
+                if gpu_index is not None:
+                    del gpu_index
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         else:
             index_global.add(embeddings_f32)
         
@@ -299,7 +282,7 @@ class STSTrainer:
 
         metadata_file = output_dir / "sts_metadata.json"
         with open(metadata_file, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2, ensure_ascii=False)
+            json.dump(metadata, f, indent=2, ensure_ascii=False, default=json_default)
         logger.info(f"  [OK] Metadata: {metadata_file.name}")
 
         logger.info(f"\n  All artifacts saved to: {output_dir}")
@@ -309,7 +292,7 @@ class STSTrainer:
 def train_sts(
     indices_to_build='all',
     force: bool = False,
-    train_file: Path = Path("nlpcomponents/datasets/sts_train.csv"),
+    train_file: Path = Path("nlpcomponents/datasets/question_tag.csv"),
     models_dir: Path = Path("nlpcomponents/models/semantic"),
     classifier_dir: Path = Path("nlpcomponents/models/tag_classifier"),
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
@@ -377,7 +360,7 @@ def train_sts(
         'dataset': {
             'fingerprint': dataset_fp,
             'num_questions': len(df),
-            'file': 'sts_train.csv'
+            'file': 'question_tag.csv'
         },
     }
     if clf_fp:
@@ -436,7 +419,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--train-csv',
         type=Path,
-        default=DATASETS_DIR / "sts_train.csv",
+        default=DATASETS_DIR / "question_tag.csv",
         help='Path to training CSV'
     )
     parser.add_argument(
@@ -536,7 +519,6 @@ if __name__ == '__main__':
         classifier_query_prefix=args.classifier_query_prefix,
     )
 
-    # Determine cache directory
     cache_dir = args.cache_dir
     if cache_dir is None:
         cache_dir = args.models_dir.parent / "cache"

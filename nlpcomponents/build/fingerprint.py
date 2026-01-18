@@ -56,20 +56,13 @@ def compute_file_fingerprint(file_path: Path) -> str:
         return "missing"
     
     try:
-        stat = file_path.stat()
-        fingerprint_data = {
-            'path': str(file_path.name),
-            'size': stat.st_size,
-            'mtime_ns': stat.st_mtime_ns
-        }
-        fingerprint_str = json.dumps(fingerprint_data, sort_keys=True)
-        fingerprint = hashlib.sha256(fingerprint_str.encode()).hexdigest()
-        
+        content = file_path.read_bytes()
+        fingerprint = hashlib.sha256(content).hexdigest()[:32]
         logger.debug(f"File fingerprint: {file_path.name} -> {fingerprint[:12]}... "
-                 f"({stat.st_size} bytes)")
+                 f"({len(content)} bytes)")
         return fingerprint
     except Exception as e:
-        logger.error(f"File fingerprint: failed to stat {file_path}: {e}")
+        logger.error(f"File fingerprint: failed to read {file_path}: {e}")
         return "unreadable"
 
 def compute_fingerprint(
@@ -87,7 +80,7 @@ def compute_fingerprint(
     if extra:
         combined += f"\n__extra__:{extra}"
     
-    final_fingerprint = hashlib.sha256(combined.encode()).hexdigest()
+    final_fingerprint = hashlib.sha256(combined.encode()).hexdigest()[:32]
     
     logger.debug(f"Combined fingerprint: {len(file_paths)} files -> {final_fingerprint[:12]}...")
     
@@ -236,8 +229,8 @@ def validate_artifact_consistency(
     
     results = {}
     
-    train_csv = datasets_dir / "sts_train.csv"
-    eval_csv = datasets_dir / "sts_eval.csv"
+    train_csv = datasets_dir / "question_tag.csv"
+    eval_csv = datasets_dir / "eval.csv"
     
     try:
         current_train_fp = compute_dataset_fingerprint(train_csv)
@@ -246,11 +239,11 @@ def validate_artifact_consistency(
         logger.error(f"Failed to compute dataset fingerprints: {e}")
         raise
     
-    results['sts_train.csv'] = {
+    results['question_tag.csv'] = {
         'status': 'present' if current_train_fp not in ('missing', 'unreadable', 'no_matching_columns') else current_train_fp,
         'fingerprint': current_train_fp
     }
-    results['sts_eval.csv'] = {
+    results['eval.csv'] = {
         'status': 'present' if current_eval_fp not in ('missing', 'unreadable', 'no_matching_columns') else current_eval_fp,
         'fingerprint': current_eval_fp
     }

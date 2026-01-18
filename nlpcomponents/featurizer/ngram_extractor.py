@@ -11,6 +11,7 @@ import pandas as pd
 
 from ..utils.constants import NGRAM_TYPES
 from ..utils.ngram_utils import extract_ngram_words_list
+from ..utils.json_utils import json_default
 
 def compute_cross_tag_idf(all_ngrams_by_tag: Dict[str, Set[str]]) -> Dict[str, float]:
     num_tags = len(all_ngrams_by_tag)
@@ -205,7 +206,7 @@ class STSNgramExtractor:
     def save_features(self, features: Dict, output_path: Path) -> None:
         print(f"\nSaving features to {output_path}")
         with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(features, f, ensure_ascii=False, indent=2)
+            json.dump(features, f, ensure_ascii=False, indent=2, default=json_default)
         print(f"Saved successfully!")
 
     def generate_and_save(

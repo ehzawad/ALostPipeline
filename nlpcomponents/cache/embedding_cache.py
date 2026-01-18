@@ -1,16 +1,3 @@
-"""
-Embedding Cache Manager
-
-Provides fingerprint-based caching for embeddings to enable O(k) incremental updates
-instead of O(n) full re-embedding on each training run.
-
-Key concepts:
-- Fingerprint: SHA256 hash of (text + tag) that uniquely identifies a question
-- Per-tag storage: Embeddings grouped by tag in separate .npy files
-- Change detection: Set operations to find new/deleted/unchanged questions
-- Assembly: Reconstruct full embedding matrix from cached pieces
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -18,6 +5,7 @@ import json
 import shutil
 import threading
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -25,14 +13,13 @@ from typing import Any, Dict, List, Optional, Set, Tuple, NamedTuple
 
 import numpy as np
 import pandas as pd
+from filelock import FileLock, Timeout as FileLockTimeout
 from loguru import logger
 
-
-CACHE_VERSION = 1
+from ..utils.json_utils import json_default
 
 
 class RowInfo(NamedTuple):
-    """Information about a row in the dataset."""
     question: str
     tag: str
     original_index: int
@@ -40,10 +27,9 @@ class RowInfo(NamedTuple):
 
 @dataclass
 class ChangeSet:
-    """Result of change detection between current data and cache."""
-    new: Set[str]  # fingerprints in current but not cache (need embedding)
-    deleted: Set[str]  # fingerprints in cache but not current (orphaned)
-    unchanged: Set[str]  # fingerprints in both (skip embedding)
+    new: Set[str]
+    deleted: Set[str]
+    unchanged: Set[str]
     
     @property
     def total_current(self) -> int:
@@ -59,12 +45,10 @@ class ChangeSet:
 
 @dataclass
 class CacheMetadata:
-    """Metadata for cache invalidation checks."""
     embedding_model: str
     embedding_dim: int
     normalize_embeddings: bool
     prefix_config_hash: str
-    version: int = CACHE_VERSION
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     last_updated: str = field(default_factory=lambda: datetime.now().isoformat())
     
@@ -78,7 +62,6 @@ class CacheMetadata:
             embedding_dim=data.get("embedding_dim", 0),
             normalize_embeddings=data.get("normalize_embeddings", True),
             prefix_config_hash=data.get("prefix_config_hash", ""),
-            version=data.get("version", 1),
             created_at=data.get("created_at", ""),
             last_updated=data.get("last_updated", ""),
         )
@@ -86,7 +69,6 @@ class CacheMetadata:
 
 @dataclass
 class CacheStats:
-    """Statistics about the embedding cache."""
     cache_type: str
     total_entries: int
     total_tags: int
@@ -113,82 +95,59 @@ class CacheStats:
 
 class EmbeddingCacheManager:
     """
-    Manages embedding cache with fingerprint-based change detection.
+    Manages embedding cache with both thread-safety (RLock) and process-safety (FileLock).
     
-    Features:
-    - Fingerprint-based identification of questions
-    - Per-tag storage for efficient incremental updates
-    - Automatic cache invalidation on config changes
-    - Thread-safe operations
-    
-    Usage:
-        cache = EmbeddingCacheManager(cache_dir, "classifier")
-        
-        # Validate or clear if config changed
-        if not cache.validate_metadata(model_name, dim, normalize, prefix_hash):
-            cache.clear()
-        
-        # Compute fingerprints and detect changes
-        fp_map = cache.compute_fingerprints_batch(df)
-        changes = cache.detect_changes(set(fp_map.keys()))
-        
-        # Embed only new questions
-        if changes.new:
-            new_embeddings = model.encode([fp_map[fp].question for fp in changes.new])
-            cache.save_new_embeddings(changes.new, new_embeddings, fp_map)
-        
-        # Assemble final matrix
-        ordered_fps = [cache.compute_fingerprint(q, t) for q, t in zip(questions, tags)]
-        embeddings = cache.assemble_embeddings(ordered_fps)
+    The cache stores embeddings organized by tag in .npy files, with an index.json
+    tracking fingerprint-to-position mappings. File locking prevents race conditions
+    when multiple processes (e.g., training + FAISS building) access the same cache.
     """
     
+    # Default timeout for acquiring file lock (5 minutes)
+    FILE_LOCK_TIMEOUT = 300.0
+    
     def __init__(self, cache_dir: Path, cache_type: str):
-        """
-        Initialize the cache manager.
-        
-        Args:
-            cache_dir: Root directory for this cache type
-            cache_type: Either "classifier" or "sts"
-        """
         self.cache_dir = Path(cache_dir)
         self.cache_type = cache_type
         self.tags_dir = self.cache_dir / "tags"
         self.index_file = self.cache_dir / "index.json"
         self.metadata_file = self.cache_dir / "metadata.json"
+        self._lock_file = self.cache_dir / ".cache.lock"
         
+        # Thread-level lock for in-process safety
         self._lock = threading.RLock()
         self._index: Optional[Dict[str, Any]] = None
         self._metadata: Optional[CacheMetadata] = None
         self._dirty = False
         
-        # Ensure directories exist
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.tags_dir.mkdir(parents=True, exist_ok=True)
         
+        # Process-level file lock for cross-process safety
+        self._file_lock = FileLock(str(self._lock_file), timeout=self.FILE_LOCK_TIMEOUT)
+        
         logger.debug(f"EmbeddingCacheManager initialized: type={cache_type}, dir={cache_dir}")
     
-    # =========================================================================
-    # Fingerprinting
-    # =========================================================================
+    @contextmanager
+    def _acquire_file_lock(self, operation: str = "cache operation"):
+        """Acquire file lock for cross-process safety during write operations."""
+        try:
+            self._file_lock.acquire()
+            logger.debug(f"Acquired file lock for {operation}")
+            yield
+        except FileLockTimeout:
+            raise TimeoutError(
+                f"Could not acquire cache lock after {self.FILE_LOCK_TIMEOUT}s for {operation}. "
+                f"Another process may be using the cache. Lock file: {self._lock_file}"
+            )
+        finally:
+            try:
+                self._file_lock.release()
+                logger.debug(f"Released file lock for {operation}")
+            except Exception as e:
+                logger.warning(f"Error releasing file lock: {e}")
     
     @staticmethod
     def compute_fingerprint(text: str, tag: str) -> str:
-        """
-        Compute a unique fingerprint for a question.
-        
-        The fingerprint is a 32-char hex string derived from SHA256 of the
-        question text and tag. Same content = same fingerprint.
-        Edit one character = completely different fingerprint.
-        
-        Args:
-            text: The question text
-            tag: The tag/label for the question
-            
-        Returns:
-            32-character hexadecimal fingerprint
-        """
-        # Use null byte as separator to avoid collisions
-        # e.g., "abc" + "def" != "ab" + "cdef"
         content = f"{text}\x00{tag}"
         return hashlib.sha256(content.encode('utf-8')).hexdigest()[:32]
     
@@ -198,34 +157,29 @@ class EmbeddingCacheManager:
         question_col: str = "question",
         tag_col: str = "tag"
     ) -> Dict[str, RowInfo]:
-        """
-        Compute fingerprints for all rows in a DataFrame.
-        
-        Args:
-            df: DataFrame with question and tag columns
-            question_col: Name of the question column
-            tag_col: Name of the tag column
-            
-        Returns:
-            Dict mapping fingerprint -> RowInfo(question, tag, original_index)
-        """
         fp_map: Dict[str, RowInfo] = {}
+        duplicates: List[Tuple[str, int, int]] = []
         
         for idx, row in df.iterrows():
             question = str(row[question_col]) if pd.notna(row[question_col]) else ""
             tag = str(row[tag_col]) if pd.notna(row[tag_col]) else ""
             
             fp = self.compute_fingerprint(question, tag)
-            fp_map[fp] = RowInfo(question=question, tag=tag, original_index=int(idx))
+            
+            if fp in fp_map:
+                duplicates.append((fp, fp_map[fp].original_index, int(idx)))
+            else:
+                fp_map[fp] = RowInfo(question=question, tag=tag, original_index=int(idx))
+        
+        if duplicates:
+            logger.warning(
+                f"Found {len(duplicates)} duplicate (question, tag) pairs. "
+                f"First few: {duplicates[:3]}. Only first occurrence will be used."
+            )
         
         return fp_map
     
-    # =========================================================================
-    # Metadata Management
-    # =========================================================================
-    
     def _load_metadata(self) -> Optional[CacheMetadata]:
-        """Load metadata from disk."""
         if not self.metadata_file.exists():
             return None
         try:
@@ -237,18 +191,19 @@ class EmbeddingCacheManager:
             return None
     
     def _save_metadata(self, metadata: CacheMetadata) -> None:
-        """Save metadata to disk."""
         metadata.last_updated = datetime.now().isoformat()
-        with open(self.metadata_file, 'w', encoding='utf-8') as f:
-            json.dump(metadata.to_dict(), f, indent=2)
+        temp_file = self.metadata_file.with_suffix('.json.tmp')
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(metadata.to_dict(), f, indent=2, default=json_default)
+        temp_file.replace(self.metadata_file)
         self._metadata = metadata
     
     @property
     def metadata(self) -> Optional[CacheMetadata]:
-        """Get current metadata, loading from disk if needed."""
-        if self._metadata is None:
-            self._metadata = self._load_metadata()
-        return self._metadata
+        with self._lock:
+            if self._metadata is None:
+                self._metadata = self._load_metadata()
+            return self._metadata
     
     def validate_metadata(
         self,
@@ -257,46 +212,26 @@ class EmbeddingCacheManager:
         normalize_embeddings: bool,
         prefix_config_hash: str
     ) -> bool:
-        """
-        Validate that cache metadata matches current configuration.
-        
-        If metadata doesn't match, the cache is invalid and should be cleared.
-        
-        Args:
-            embedding_model: Name of the embedding model
-            embedding_dim: Dimension of embeddings
-            normalize_embeddings: Whether embeddings are normalized
-            prefix_config_hash: Hash of the prefix configuration
-            
-        Returns:
-            True if cache is valid, False if it should be cleared
-        """
         current = self.metadata
         if current is None:
+            if self.index.get("entries"):
+                logger.warning("Cache has entries but missing metadata. Treating as invalid.")
+                return False
             logger.debug("No cache metadata found, cache is empty/new")
-            return True  # Empty cache is valid
+            return True
         
-        # Check version
-        if current.version != CACHE_VERSION:
-            logger.info(f"Cache version mismatch: {current.version} != {CACHE_VERSION}")
-            return False
-        
-        # Check embedding model
         if current.embedding_model != embedding_model:
             logger.info(f"Embedding model changed: {current.embedding_model} -> {embedding_model}")
             return False
         
-        # Check embedding dimension
         if current.embedding_dim != embedding_dim:
             logger.info(f"Embedding dim changed: {current.embedding_dim} -> {embedding_dim}")
             return False
         
-        # Check normalization
         if current.normalize_embeddings != normalize_embeddings:
             logger.info(f"Normalization changed: {current.normalize_embeddings} -> {normalize_embeddings}")
             return False
         
-        # Check prefix config
         if current.prefix_config_hash != prefix_config_hash:
             logger.info(f"Prefix config changed: {current.prefix_config_hash[:16]}... -> {prefix_config_hash[:16]}...")
             return False
@@ -310,7 +245,6 @@ class EmbeddingCacheManager:
         normalize_embeddings: bool,
         prefix_config_hash: str
     ) -> None:
-        """Save metadata for cache validation."""
         existing = self.metadata
         is_new = existing is None
         metadata = CacheMetadata(
@@ -318,64 +252,44 @@ class EmbeddingCacheManager:
             embedding_dim=embedding_dim,
             normalize_embeddings=normalize_embeddings,
             prefix_config_hash=prefix_config_hash,
-            version=CACHE_VERSION,
             created_at=existing.created_at if existing else datetime.now().isoformat(),
         )
         self._save_metadata(metadata)
         if is_new:
             logger.info(f"  Cache metadata saved: model={embedding_model}, dim={embedding_dim}")
     
-    # =========================================================================
-    # Index Management
-    # =========================================================================
-    
     def _load_index(self) -> Dict[str, Any]:
-        """Load index from disk."""
         if not self.index_file.exists():
-            return {"version": CACHE_VERSION, "entries": {}, "tag_counts": {}}
+            return {"entries": {}, "tag_counts": {}}
         try:
             with open(self.index_file, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
             logger.warning(f"Failed to load cache index: {e}")
-            return {"version": CACHE_VERSION, "entries": {}, "tag_counts": {}}
+            return {"entries": {}, "tag_counts": {}}
     
     def _save_index(self) -> None:
-        """Save index to disk."""
         if self._index is None:
             return
-        with open(self.index_file, 'w', encoding='utf-8') as f:
-            json.dump(self._index, f)
+        temp_file = self.index_file.with_suffix('.json.tmp')
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(self._index, f, default=json_default)
+        temp_file.replace(self.index_file)
         self._dirty = False
     
     @property
     def index(self) -> Dict[str, Any]:
-        """Get current index, loading from disk if needed."""
         with self._lock:
             if self._index is None:
                 self._index = self._load_index()
             return self._index
     
     def flush(self) -> None:
-        """Flush any pending changes to disk."""
         with self._lock:
             if self._dirty and self._index is not None:
                 self._save_index()
     
-    # =========================================================================
-    # Change Detection
-    # =========================================================================
-    
     def detect_changes(self, current_fingerprints: Set[str]) -> ChangeSet:
-        """
-        Detect what has changed between current data and cache.
-        
-        Args:
-            current_fingerprints: Set of fingerprints for current dataset
-            
-        Returns:
-            ChangeSet with new, deleted, and unchanged fingerprints
-        """
         cached_fingerprints = set(self.index.get("entries", {}).keys())
         
         new = current_fingerprints - cached_fingerprints
@@ -384,59 +298,52 @@ class EmbeddingCacheManager:
         
         return ChangeSet(new=new, deleted=deleted, unchanged=unchanged)
     
-    def remove_from_index(self, fingerprints: Set[str]) -> int:
+    def _remove_from_index_no_save(self, fingerprints: Set[str]) -> int:
         """
-        Remove fingerprints from the index (mark as orphaned).
-        
-        The actual embeddings remain in storage and are cleaned up by gc.
-        
-        Args:
-            fingerprints: Set of fingerprints to remove
-            
-        Returns:
-            Number of entries removed
+        Internal method to remove fingerprints from index without saving.
+        Caller must hold both thread lock and file lock, and is responsible for saving.
         """
-        with self._lock:
-            entries = self.index.get("entries", {})
-            tag_counts = self.index.get("tag_counts", {})
-            removed = 0
-            
-            for fp in fingerprints:
-                if fp in entries:
-                    entry = entries.pop(fp)
-                    tag = entry.get("tag")
-                    if tag and tag in tag_counts:
-                        tag_counts[tag] = max(0, tag_counts[tag] - 1)
-                    removed += 1
-            
-            if removed > 0:
-                self._dirty = True
-                self._save_index()
-            
-            return removed
+        entries = self.index.get("entries", {})
+        tag_counts = self.index.get("tag_counts", {})
+        removed = 0
+        
+        for fp in fingerprints:
+            if fp in entries:
+                entry = entries.pop(fp)
+                tag = entry.get("tag")
+                if tag and tag in tag_counts:
+                    tag_counts[tag] = max(0, tag_counts[tag] - 1)
+                removed += 1
+        
+        if removed > 0:
+            self._dirty = True
+        
+        return removed
     
-    # =========================================================================
-    # Per-Tag Storage
-    # =========================================================================
+    def remove_from_index(self, fingerprints: Set[str]) -> int:
+        """Remove fingerprints from the index. Uses file lock for cross-process safety."""
+        with self._acquire_file_lock("remove_from_index"):
+            with self._lock:
+                removed = self._remove_from_index_no_save(fingerprints)
+                if removed > 0:
+                    self._save_index()
+                return removed
     
     def _tag_filename(self, tag: str) -> str:
-        """Get filename for a tag's embeddings (hashed to avoid filesystem issues)."""
-        return hashlib.md5(tag.encode('utf-8')).hexdigest()[:16] + ".npy"
+        return hashlib.sha256(tag.encode('utf-8')).hexdigest() + ".npy"
     
     def _tag_filepath(self, tag: str) -> Path:
-        """Get full path to a tag's embedding file."""
         return self.tags_dir / self._tag_filename(tag)
-    
+
+    def _atomic_save_npy(self, filepath: Path, embeddings: np.ndarray) -> None:
+        temp_filepath = filepath.with_suffix(filepath.suffix + ".tmp")
+        temp_filepath.parent.mkdir(parents=True, exist_ok=True)
+        # Use a file handle so numpy doesn't append ".npy" to the temp filename.
+        with open(temp_filepath, "wb") as f:
+            np.save(f, embeddings.astype("float32", copy=False))
+        temp_filepath.replace(filepath)
+
     def load_embeddings_for_tag(self, tag: str) -> Optional[np.ndarray]:
-        """
-        Load embeddings for a specific tag.
-        
-        Args:
-            tag: The tag name
-            
-        Returns:
-            numpy array of embeddings or None if not found
-        """
         filepath = self._tag_filepath(tag)
         if not filepath.exists():
             return None
@@ -453,12 +360,10 @@ class EmbeddingCacheManager:
         fingerprints: List[str]
     ) -> None:
         """
-        Save embeddings for a tag, replacing any existing data.
+        Save embeddings for a tag, replacing any existing embeddings.
         
-        Args:
-            tag: The tag name
-            embeddings: numpy array of shape (n, embedding_dim)
-            fingerprints: List of fingerprints in same order as embeddings
+        Uses both thread lock (in-process) and file lock (cross-process) to prevent
+        race conditions when multiple processes access the same cache.
         """
         if len(fingerprints) != embeddings.shape[0]:
             raise ValueError(
@@ -466,23 +371,24 @@ class EmbeddingCacheManager:
                 f"embedding count ({embeddings.shape[0]})"
             )
         
-        with self._lock:
-            filepath = self._tag_filepath(tag)
-            np.save(filepath, embeddings.astype('float32'))
-            
-            # Update index
-            entries = self.index.setdefault("entries", {})
-            tag_counts = self.index.setdefault("tag_counts", {})
-            
-            for i, fp in enumerate(fingerprints):
-                entries[fp] = {
-                    "tag": tag,
-                    "position": i,
-                }
-            
-            tag_counts[tag] = len(fingerprints)
-            self._dirty = True
-            self._save_index()
+        with self._acquire_file_lock(f"save_embeddings_for_tag({tag})"):
+            with self._lock:
+                filepath = self._tag_filepath(tag)
+                # Write to temp file first, then rename for atomicity
+                self._atomic_save_npy(filepath, embeddings)
+                
+                entries = self.index.setdefault("entries", {})
+                tag_counts = self.index.setdefault("tag_counts", {})
+                
+                for i, fp in enumerate(fingerprints):
+                    entries[fp] = {
+                        "tag": tag,
+                        "position": i,
+                    }
+                
+                tag_counts[tag] = len(fingerprints)
+                self._dirty = True
+                self._save_index()
     
     def append_embeddings_to_tag(
         self,
@@ -491,12 +397,10 @@ class EmbeddingCacheManager:
         new_fingerprints: List[str]
     ) -> None:
         """
-        Append new embeddings to an existing tag file.
+        Append new embeddings to an existing tag's cache file.
         
-        Args:
-            tag: The tag name
-            new_embeddings: numpy array of new embeddings
-            new_fingerprints: List of fingerprints for new embeddings
+        Uses both thread lock (in-process) and file lock (cross-process) to prevent
+        race conditions when multiple processes access the same cache.
         """
         if len(new_fingerprints) != new_embeddings.shape[0]:
             raise ValueError(
@@ -504,55 +408,43 @@ class EmbeddingCacheManager:
                 f"embedding count ({new_embeddings.shape[0]})"
             )
         
-        with self._lock:
-            existing = self.load_embeddings_for_tag(tag)
-            
-            if existing is not None:
-                # Get current count from index
-                entries = self.index.get("entries", {})
-                current_count = sum(1 for e in entries.values() if e.get("tag") == tag)
+        # Acquire file lock for cross-process safety
+        with self._acquire_file_lock(f"append_embeddings_to_tag({tag})"):
+            with self._lock:
+                # Re-load existing embeddings inside lock to ensure consistency
+                existing = self.load_embeddings_for_tag(tag)
                 
-                # Concatenate
-                combined = np.vstack([existing, new_embeddings])
-                start_position = current_count
-            else:
-                combined = new_embeddings
-                start_position = 0
-            
-            # Save combined embeddings
-            filepath = self._tag_filepath(tag)
-            np.save(filepath, combined.astype('float32'))
-            
-            # Update index
-            entries = self.index.setdefault("entries", {})
-            tag_counts = self.index.setdefault("tag_counts", {})
-            
-            for i, fp in enumerate(new_fingerprints):
-                entries[fp] = {
-                    "tag": tag,
-                    "position": start_position + i,
-                }
-            
-            tag_counts[tag] = tag_counts.get(tag, 0) + len(new_fingerprints)
-            self._dirty = True
-            self._save_index()
+                if existing is not None:
+                    start_position = len(existing)
+                    combined = np.vstack([existing, new_embeddings])
+                else:
+                    combined = new_embeddings
+                    start_position = 0
+                
+                # Write to temp file first, then rename for atomicity
+                filepath = self._tag_filepath(tag)
+                self._atomic_save_npy(filepath, combined)
+                
+                entries = self.index.setdefault("entries", {})
+                tag_counts = self.index.setdefault("tag_counts", {})
+                
+                for i, fp in enumerate(new_fingerprints):
+                    entries[fp] = {
+                        "tag": tag,
+                        "position": start_position + i,
+                    }
+                
+                tag_counts[tag] = tag_counts.get(tag, 0) + len(new_fingerprints)
+                self._dirty = True
+                self._save_index()
     
     def save_new_embeddings(
         self,
-        new_fingerprints: Set[str],
+        new_fingerprints: List[str],
         new_embeddings: np.ndarray,
         fp_map: Dict[str, RowInfo]
     ) -> None:
-        """
-        Save new embeddings, grouping by tag for efficient storage.
-        
-        Args:
-            new_fingerprints: Set of fingerprints for new questions
-            new_embeddings: Embeddings array in same order as new_fingerprints iteration
-            fp_map: Mapping from fingerprint to RowInfo
-        """
-        # Convert set to list to maintain order
-        fp_list = list(new_fingerprints)
+        fp_list = new_fingerprints
         
         if len(fp_list) != new_embeddings.shape[0]:
             raise ValueError(
@@ -560,13 +452,11 @@ class EmbeddingCacheManager:
                 f"embedding count ({new_embeddings.shape[0]})"
             )
         
-        # Group by tag
         tag_groups: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
         for i, fp in enumerate(fp_list):
             tag = fp_map[fp].tag
             tag_groups[tag].append((fp, i))
         
-        # Save each tag group
         for tag, fp_indices in tag_groups.items():
             fps = [fp for fp, _ in fp_indices]
             indices = [idx for _, idx in fp_indices]
@@ -576,31 +466,16 @@ class EmbeddingCacheManager:
         
         logger.info(f"  Saved {len(fp_list)} embeddings to cache ({len(tag_groups)} tags updated)")
     
-    # =========================================================================
-    # Assembly
-    # =========================================================================
-    
     def assemble_embeddings(
         self,
         ordered_fingerprints: List[str],
         embedding_dim: Optional[int] = None
     ) -> np.ndarray:
-        """
-        Assemble embedding matrix from cache in specified order.
-        
-        Args:
-            ordered_fingerprints: List of fingerprints in desired output order
-            embedding_dim: Embedding dimension (uses metadata if not provided)
-            
-        Returns:
-            numpy array of shape (len(ordered_fingerprints), embedding_dim)
-        """
         n = len(ordered_fingerprints)
         if n == 0:
             dim = embedding_dim or (self.metadata.embedding_dim if self.metadata else 1024)
             return np.zeros((0, dim), dtype='float32')
         
-        # Get embedding dimension from metadata
         if embedding_dim is None:
             if self.metadata is None:
                 raise ValueError("No metadata found and embedding_dim not provided")
@@ -609,7 +484,6 @@ class EmbeddingCacheManager:
         result = np.zeros((n, embedding_dim), dtype='float32')
         entries = self.index.get("entries", {})
         
-        # Group by tag for efficient file access
         tag_groups: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
         missing = []
         
@@ -628,7 +502,6 @@ class EmbeddingCacheManager:
                 f"First few: {missing[:5]}"
             )
         
-        # Load each tag file once and extract needed embeddings
         for tag, positions in tag_groups.items():
             tag_embeddings = self.load_embeddings_for_tag(tag)
             if tag_embeddings is None:
@@ -644,148 +517,128 @@ class EmbeddingCacheManager:
         
         return result
     
-    # =========================================================================
-    # Cache Management
-    # =========================================================================
-    
     def clear(self) -> None:
-        """Clear all cached data."""
-        with self._lock:
-            # Remove tag files
-            if self.tags_dir.exists():
-                shutil.rmtree(self.tags_dir)
-            self.tags_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Remove index and metadata
-            if self.index_file.exists():
-                self.index_file.unlink()
-            if self.metadata_file.exists():
-                self.metadata_file.unlink()
-            
-            # Reset in-memory state
-            self._index = None
-            self._metadata = None
-            self._dirty = False
-            
-            logger.info(f"Cleared {self.cache_type} embedding cache")
+        """Clear all cached embeddings. Uses file lock for cross-process safety."""
+        with self._acquire_file_lock("clear"):
+            with self._lock:
+                if self.tags_dir.exists():
+                    shutil.rmtree(self.tags_dir)
+                self.tags_dir.mkdir(parents=True, exist_ok=True)
+                
+                if self.index_file.exists():
+                    self.index_file.unlink()
+                if self.metadata_file.exists():
+                    self.metadata_file.unlink()
+                
+                self._index = None
+                self._metadata = None
+                self._dirty = False
+                
+                logger.info(f"Cleared {self.cache_type} embedding cache")
     
     def garbage_collect(
         self,
         current_fingerprints: Optional[Set[str]] = None
     ) -> Tuple[int, int]:
         """
-        Remove orphaned embeddings from storage.
+        Garbage collect orphaned embeddings and compact cache files.
         
-        This rewrites tag files to only include embeddings that are
-        still referenced in the index (or in current_fingerprints).
-        
-        Args:
-            current_fingerprints: If provided, also removes entries not in this set
-            
-        Returns:
-            Tuple of (entries_removed, bytes_freed)
+        Uses file lock for cross-process safety. Only saves the index once at the end
+        to avoid redundant I/O operations.
         """
-        with self._lock:
-            entries = self.index.get("entries", {})
-            
-            # If current fingerprints provided, first remove from index
-            if current_fingerprints is not None:
-                deleted = set(entries.keys()) - current_fingerprints
-                self.remove_from_index(deleted)
+        with self._acquire_file_lock("garbage_collect"):
+            with self._lock:
                 entries = self.index.get("entries", {})
-            
-            # Group remaining entries by tag
-            tag_entries: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
-            for fp, entry in entries.items():
-                tag = entry["tag"]
-                position = entry["position"]
-                tag_entries[tag].append((fp, position))
-            
-            entries_removed = 0
-            bytes_freed = 0
-            
-            # Rewrite each tag file with only valid entries
-            for tag_file in self.tags_dir.glob("*.npy"):
-                tag_hash = tag_file.stem
                 
-                # Find which tag this file belongs to
-                matching_tag = None
-                for tag in tag_entries.keys():
-                    if self._tag_filename(tag) == tag_file.name:
-                        matching_tag = tag
-                        break
+                # Remove orphaned fingerprints (no longer in current dataset)
+                if current_fingerprints is not None:
+                    deleted = set(entries.keys()) - current_fingerprints
+                    # Use internal no-save version to avoid double-save
+                    self._remove_from_index_no_save(deleted)
+                    entries = self.index.get("entries", {})
                 
-                if matching_tag is None:
-                    # Orphaned file, no entries reference it
-                    bytes_freed += tag_file.stat().st_size
-                    tag_file.unlink()
-                    logger.debug(f"Removed orphaned tag file: {tag_file.name}")
-                    continue
+                tag_entries: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
+                for fp, entry in entries.items():
+                    tag = entry["tag"]
+                    position = entry["position"]
+                    tag_entries[tag].append((fp, position))
                 
-                # Load and compact
-                try:
-                    embeddings = np.load(tag_file)
-                    original_size = tag_file.stat().st_size
-                    original_count = len(embeddings)
+                entries_removed = 0
+                bytes_freed = 0
+                
+                for tag_file in self.tags_dir.glob("*.npy"):
+                    tag_hash = tag_file.stem
                     
-                    fps_and_positions = tag_entries[matching_tag]
-                    if not fps_and_positions:
-                        bytes_freed += original_size
+                    matching_tag = None
+                    for tag in tag_entries.keys():
+                        if self._tag_filename(tag) == tag_file.name:
+                            matching_tag = tag
+                            break
+                    
+                    if matching_tag is None:
+                        bytes_freed += tag_file.stat().st_size
                         tag_file.unlink()
+                        logger.debug(f"Removed orphaned tag file: {tag_file.name}")
                         continue
                     
-                    # Sort by position to maintain order
-                    fps_and_positions.sort(key=lambda x: x[1])
-                    
-                    # Extract valid embeddings and build new index
-                    valid_positions = [pos for _, pos in fps_and_positions]
-                    valid_fps = [fp for fp, _ in fps_and_positions]
-                    
-                    # Check for gaps (orphaned embeddings)
-                    max_pos = max(valid_positions) if valid_positions else -1
-                    if max_pos >= len(embeddings):
-                        logger.warning(
-                            f"Position out of bounds in tag '{matching_tag}': "
-                            f"max_pos={max_pos}, embeddings={len(embeddings)}"
-                        )
-                        continue
-                    
-                    new_embeddings = embeddings[valid_positions]
-                    
-                    # Update index with new positions
-                    for new_pos, fp in enumerate(valid_fps):
-                        entries[fp]["position"] = new_pos
-                    
-                    # Save compacted file
-                    np.save(tag_file, new_embeddings.astype('float32'))
-                    
-                    new_size = tag_file.stat().st_size
-                    entries_removed += original_count - len(new_embeddings)
-                    bytes_freed += original_size - new_size
-                    
-                except Exception as e:
-                    logger.error(f"Error during GC for {tag_file.name}: {e}")
-            
-            # Update tag counts
-            tag_counts = self.index.setdefault("tag_counts", {})
-            for tag, fps in tag_entries.items():
-                tag_counts[tag] = len(fps)
-            
-            self._dirty = True
-            self._save_index()
-            
-            return entries_removed, bytes_freed
-    
-    # =========================================================================
-    # Statistics
-    # =========================================================================
+                    try:
+                        embeddings = np.load(tag_file)
+                        original_size = tag_file.stat().st_size
+                        original_count = len(embeddings)
+                        
+                        fps_and_positions = tag_entries[matching_tag]
+                        if not fps_and_positions:
+                            bytes_freed += original_size
+                            tag_file.unlink()
+                            continue
+                        
+                        fps_and_positions.sort(key=lambda x: x[1])
+                        
+                        valid_positions = [pos for _, pos in fps_and_positions]
+                        valid_fps = [fp for fp, _ in fps_and_positions]
+                        
+                        max_pos = max(valid_positions) if valid_positions else -1
+                        if max_pos >= len(embeddings):
+                            logger.warning(
+                                f"Corrupted cache for tag '{matching_tag}': "
+                                f"max_pos={max_pos}, file_len={len(embeddings)}. Removing corrupted entries."
+                            )
+                            for fp in valid_fps:
+                                entries.pop(fp, None)
+                            tag_file.unlink()
+                            entries_removed += original_count
+                            bytes_freed += original_size
+                            continue
+                        
+                        new_embeddings = embeddings[valid_positions]
+                        
+                        for new_pos, fp in enumerate(valid_fps):
+                            entries[fp]["position"] = new_pos
+                        
+                        # Write to temp file first, then rename for atomicity
+                        self._atomic_save_npy(tag_file, new_embeddings)
+                        
+                        new_size = tag_file.stat().st_size
+                        entries_removed += original_count - len(new_embeddings)
+                        bytes_freed += original_size - new_size
+                        
+                    except Exception as e:
+                        logger.error(f"Error during GC for {tag_file.name}: {e}")
+                
+                tag_counts = self.index.setdefault("tag_counts", {})
+                for tag, fps in tag_entries.items():
+                    tag_counts[tag] = len(fps)
+                
+                # Only save index once at the end (fixes double-save issue)
+                self._dirty = True
+                self._save_index()
+                
+                return entries_removed, bytes_freed
     
     def get_stats(self) -> CacheStats:
-        """Get statistics about the cache."""
         entries = self.index.get("entries", {})
         tag_counts = self.index.get("tag_counts", {})
         
-        # Calculate total size
         total_size = 0
         if self.index_file.exists():
             total_size += self.index_file.stat().st_size
@@ -807,26 +660,18 @@ class EmbeddingCacheManager:
         )
     
     def exists(self) -> bool:
-        """Check if cache has any data."""
         return self.index_file.exists() and len(self.index.get("entries", {})) > 0
 
 
 def get_prefix_config_hash(prefix_config) -> str:
     """
-    Compute a hash of the prefix configuration for cache invalidation.
-    
-    Args:
-        prefix_config: An EmbeddingPrefixConfig instance
-        
-    Returns:
-        32-character hexadecimal hash
+    Compute hash of ALL prefix config settings.
+    Use this for general-purpose caching; prefer specific hash functions
+    (get_classifier_prefix_hash, get_sts_prefix_hash) for type-specific caches.
     """
-    # Use the existing get_cache_key method if available
     if hasattr(prefix_config, 'get_cache_key'):
         cache_key = prefix_config.get_cache_key()
     else:
-        # Fallback: serialize relevant attributes
-        import json
         cache_key = json.dumps({
             'use_native_prompts': getattr(prefix_config, 'use_native_prompts', False),
             'use_prefixes': getattr(prefix_config, 'use_prefixes', True),
@@ -834,4 +679,75 @@ def get_prefix_config_hash(prefix_config) -> str:
             'instruct_task': getattr(prefix_config, 'instruct_task', ''),
         }, sort_keys=True)
     
+    return hashlib.sha256(cache_key.encode('utf-8')).hexdigest()[:32]
+
+
+def get_classifier_prefix_hash(prefix_config) -> str:
+    """
+    Compute hash of classifier-relevant prefix settings only.
+    
+    The classifier uses format_classifier_queries_batch() which only depends on:
+    - use_native_prompts
+    - use_prefixes  
+    - use_instruct_format
+    - instruct_task (only if use_instruct_format is True)
+    - classifier_query_prefix (only if use_prefixes is True and use_instruct_format is False)
+    
+    This avoids unnecessary cache invalidation when STS-only settings change.
+    """
+    use_native = getattr(prefix_config, 'use_native_prompts', False)
+    use_prefixes = getattr(prefix_config, 'use_prefixes', True)
+    use_instruct = getattr(prefix_config, 'use_instruct_format', True)
+    
+    # Build cache key with only relevant fields
+    cache_data = {
+        'use_native_prompts': use_native,
+        'use_prefixes': use_prefixes,
+        'use_instruct_format': use_instruct,
+    }
+    
+    # Only include instruct_task if actually used
+    if use_prefixes and use_instruct:
+        cache_data['instruct_task'] = getattr(prefix_config, 'instruct_task', '')
+    
+    # Only include classifier_query_prefix if used (prefixes enabled, instruct disabled)
+    if use_prefixes and not use_instruct:
+        cache_data['classifier_query_prefix'] = getattr(prefix_config, 'classifier_query_prefix', '')
+    
+    cache_key = json.dumps(cache_data, sort_keys=True)
+    return hashlib.sha256(cache_key.encode('utf-8')).hexdigest()[:32]
+
+
+def get_sts_prefix_hash(prefix_config) -> str:
+    """
+    Compute hash of STS-relevant prefix settings only.
+    
+    STS uses format_sts_passages_batch() for corpus embeddings which only depends on:
+    - use_native_prompts
+    - use_prefixes
+    - use_instruct_format (passages don't use instruct format even when enabled)
+    - sts_passage_prefix (only if use_prefixes is True and use_instruct_format is False)
+    
+    Note: Query formatting at inference time uses format_sts_query() which has different
+    settings, but the cache is for passages (corpus), not queries.
+    
+    This avoids unnecessary cache invalidation when classifier-only settings change.
+    """
+    use_native = getattr(prefix_config, 'use_native_prompts', False)
+    use_prefixes = getattr(prefix_config, 'use_prefixes', True)
+    use_instruct = getattr(prefix_config, 'use_instruct_format', True)
+    
+    # Build cache key with only relevant fields
+    cache_data = {
+        'use_native_prompts': use_native,
+        'use_prefixes': use_prefixes,
+        'use_instruct_format': use_instruct,
+    }
+    
+    # Only include sts_passage_prefix if used (prefixes enabled, instruct disabled)
+    # Note: When use_instruct_format is True, passages are NOT prefixed (only queries are)
+    if use_prefixes and not use_instruct:
+        cache_data['sts_passage_prefix'] = getattr(prefix_config, 'sts_passage_prefix', '')
+    
+    cache_key = json.dumps(cache_data, sort_keys=True)
     return hashlib.sha256(cache_key.encode('utf-8')).hexdigest()[:32]
