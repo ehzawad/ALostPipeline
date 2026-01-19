@@ -15,6 +15,14 @@ from .embedding_cache import (
     ChangeSet,
     RowInfo,
     get_prefix_config_hash,
+    get_classifier_prefix_hash,
+    get_sts_prefix_hash,
+    get_normalizer_config_hash,
+    detect_cache_version,
+    needs_cache_migration,
+    CacheMigrationInfo,
+    migrate_cache_v1_to_v2,
+    FINGERPRINT_LENGTH,
 )
 
 __all__ = [
@@ -33,4 +41,13 @@ __all__ = [
     'ChangeSet',
     'RowInfo',
     'get_prefix_config_hash',
+    'get_classifier_prefix_hash',
+    'get_sts_prefix_hash',
+    'get_normalizer_config_hash',
+    # Cache migration
+    'detect_cache_version',
+    'needs_cache_migration',
+    'CacheMigrationInfo',
+    'migrate_cache_v1_to_v2',
+    'FINGERPRINT_LENGTH',
 ]

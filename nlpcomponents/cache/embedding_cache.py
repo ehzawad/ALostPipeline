@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, NamedTuple
+from typing import Any, Dict, List, Optional, Set, Tuple, NamedTuple, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -18,11 +18,19 @@ from loguru import logger
 
 from ..utils.json_utils import json_default
 
+if TYPE_CHECKING:
+    from ..preprocessing.normalizer import TextNormalizer
+
+# Fingerprint length: 16 hex chars = 64 bits, fits in int64 for FAISS IDs
+FINGERPRINT_LENGTH = 16
+
 
 class RowInfo(NamedTuple):
-    question: str
-    tag: str
-    original_index: int
+    """Information about a row in the dataset."""
+    question: str  # Original question text
+    tag: str  # Associated tag
+    original_index: int  # Row index in the DataFrame
+    normalized_question: str = ""  # Normalized text used for fingerprinting
 
 
 @dataclass
@@ -51,6 +59,9 @@ class CacheMetadata:
     prefix_config_hash: str
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     last_updated: str = field(default_factory=lambda: datetime.now().isoformat())
+    # New fields for v2 cache scheme
+    cache_version: int = 2  # Version 2 uses normalized question-only fingerprints
+    normalizer_config_hash: str = ""  # Hash of normalizer settings
     
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -64,6 +75,8 @@ class CacheMetadata:
             prefix_config_hash=data.get("prefix_config_hash", ""),
             created_at=data.get("created_at", ""),
             last_updated=data.get("last_updated", ""),
+            cache_version=data.get("cache_version", 1),  # Default to v1 for old caches
+            normalizer_config_hash=data.get("normalizer_config_hash", ""),
         )
 
 
@@ -111,13 +124,16 @@ class EmbeddingCacheManager:
         self.tags_dir = self.cache_dir / "tags"
         self.index_file = self.cache_dir / "index.json"
         self.metadata_file = self.cache_dir / "metadata.json"
+        self.tag_mapping_file = self.cache_dir / "tag_mapping.json"
         self._lock_file = self.cache_dir / ".cache.lock"
         
         # Thread-level lock for in-process safety
         self._lock = threading.RLock()
         self._index: Optional[Dict[str, Any]] = None
         self._metadata: Optional[CacheMetadata] = None
+        self._tag_mapping: Optional[Dict[str, Any]] = None
         self._dirty = False
+        self._tag_mapping_dirty = False
         
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.tags_dir.mkdir(parents=True, exist_ok=True)
@@ -147,35 +163,108 @@ class EmbeddingCacheManager:
                 logger.warning(f"Error releasing file lock: {e}")
     
     @staticmethod
-    def compute_fingerprint(text: str, tag: str) -> str:
-        content = f"{text}\x00{tag}"
-        return hashlib.sha256(content.encode('utf-8')).hexdigest()[:32]
+    def compute_fingerprint(text: str, tag: str = "", normalizer: Optional["TextNormalizer"] = None) -> str:
+        """
+        Compute a fingerprint for a question text.
+        
+        In v2 cache scheme (default), fingerprint is based on normalized question only.
+        Tag is ignored for fingerprinting but tracked separately for organization.
+        
+        Args:
+            text: The question text
+            tag: Ignored in v2 scheme (kept for backwards compatibility signature)
+            normalizer: Optional text normalizer. If provided, text is normalized first.
+            
+        Returns:
+            16-character hex fingerprint (64 bits, fits in int64 for FAISS IDs)
+        """
+        # Normalize text if normalizer provided
+        if normalizer is not None:
+            text = normalizer.normalize(text)
+        
+        # V2 scheme: fingerprint based on question only, not question+tag
+        return hashlib.sha256(text.encode('utf-8')).hexdigest()[:FINGERPRINT_LENGTH]
+    
+    @staticmethod
+    def fingerprint_to_faiss_id(fingerprint: str) -> int:
+        """
+        Convert a fingerprint to a FAISS-compatible int64 ID.
+        
+        Uses first 16 hex chars (64 bits) of fingerprint.
+        """
+        # Take first 16 hex chars and convert to int
+        hex_str = fingerprint[:FINGERPRINT_LENGTH]
+        return int(hex_str, 16)
+    
+    @staticmethod
+    def faiss_id_to_fingerprint_prefix(faiss_id: int) -> str:
+        """
+        Convert a FAISS int64 ID back to fingerprint hex prefix.
+        
+        Note: This only gives the first 16 chars; the full fingerprint
+        must be looked up in the index if needed.
+        """
+        return format(faiss_id, '016x')
     
     def compute_fingerprints_batch(
         self,
         df: pd.DataFrame,
         question_col: str = "question",
-        tag_col: str = "tag"
+        tag_col: str = "tag",
+        normalizer: Optional["TextNormalizer"] = None
     ) -> Dict[str, RowInfo]:
+        """
+        Compute fingerprints for all rows in a DataFrame.
+        
+        In v2 cache scheme, fingerprints are based on normalized question text only.
+        Duplicate questions (same normalized text) are detected and warned about.
+        
+        Args:
+            df: DataFrame with question and tag columns
+            question_col: Name of question column
+            tag_col: Name of tag column
+            normalizer: Text normalizer for consistent fingerprinting
+            
+        Returns:
+            Dict mapping fingerprint -> RowInfo
+        """
         fp_map: Dict[str, RowInfo] = {}
-        duplicates: List[Tuple[str, int, int]] = []
+        duplicates: List[Tuple[str, str, str, int, int]] = []  # (fp, tag1, tag2, idx1, idx2)
         
         for idx, row in df.iterrows():
             question = str(row[question_col]) if pd.notna(row[question_col]) else ""
             tag = str(row[tag_col]) if pd.notna(row[tag_col]) else ""
             
-            fp = self.compute_fingerprint(question, tag)
+            # Normalize question for fingerprinting
+            normalized = normalizer.normalize(question) if normalizer else question
+            
+            # V2 scheme: fingerprint from normalized question only
+            fp = self.compute_fingerprint(normalized)
             
             if fp in fp_map:
-                duplicates.append((fp, fp_map[fp].original_index, int(idx)))
+                existing = fp_map[fp]
+                # In v2, same fingerprint means same normalized question
+                # This should have been caught by data validator, but log it anyway
+                if existing.tag != tag:
+                    duplicates.append((fp, existing.tag, tag, existing.original_index, int(idx)))
+                # Keep the first occurrence
             else:
-                fp_map[fp] = RowInfo(question=question, tag=tag, original_index=int(idx))
+                fp_map[fp] = RowInfo(
+                    question=question,
+                    tag=tag,
+                    original_index=int(idx),
+                    normalized_question=normalized
+                )
         
         if duplicates:
             logger.warning(
-                f"Found {len(duplicates)} duplicate (question, tag) pairs. "
-                f"First few: {duplicates[:3]}. Only first occurrence will be used."
+                f"Found {len(duplicates)} duplicate questions across different tags. "
+                f"This indicates data pollution that should be fixed."
             )
+            for fp, tag1, tag2, idx1, idx2 in duplicates[:5]:
+                logger.warning(f"  Duplicate: rows {idx1} (tag={tag1}) and {idx2} (tag={tag2})")
+            if len(duplicates) > 5:
+                logger.warning(f"  ... and {len(duplicates) - 5} more duplicates")
         
         return fp_map
     
@@ -210,8 +299,14 @@ class EmbeddingCacheManager:
         embedding_model: str,
         embedding_dim: int,
         normalize_embeddings: bool,
-        prefix_config_hash: str
+        prefix_config_hash: str,
+        normalizer_config_hash: str = ""
     ) -> bool:
+        """
+        Validate that current cache metadata matches expected configuration.
+        
+        Returns True if cache is valid and can be reused, False if it should be cleared.
+        """
         current = self.metadata
         if current is None:
             if self.index.get("entries"):
@@ -219,6 +314,11 @@ class EmbeddingCacheManager:
                 return False
             logger.debug("No cache metadata found, cache is empty/new")
             return True
+        
+        # Check cache version - v1 caches need migration
+        if current.cache_version < 2:
+            logger.info(f"Cache version outdated: v{current.cache_version} -> v2 (requires migration)")
+            return False
         
         if current.embedding_model != embedding_model:
             logger.info(f"Embedding model changed: {current.embedding_model} -> {embedding_model}")
@@ -236,6 +336,12 @@ class EmbeddingCacheManager:
             logger.info(f"Prefix config changed: {current.prefix_config_hash[:16]}... -> {prefix_config_hash[:16]}...")
             return False
         
+        # Check normalizer config if provided
+        if normalizer_config_hash and current.normalizer_config_hash:
+            if current.normalizer_config_hash != normalizer_config_hash:
+                logger.info(f"Normalizer config changed: {current.normalizer_config_hash[:16]}... -> {normalizer_config_hash[:16]}...")
+                return False
+        
         return True
     
     def save_metadata(
@@ -243,8 +349,10 @@ class EmbeddingCacheManager:
         embedding_model: str,
         embedding_dim: int,
         normalize_embeddings: bool,
-        prefix_config_hash: str
+        prefix_config_hash: str,
+        normalizer_config_hash: str = ""
     ) -> None:
+        """Save cache metadata including v2 scheme fields."""
         existing = self.metadata
         is_new = existing is None
         metadata = CacheMetadata(
@@ -253,10 +361,12 @@ class EmbeddingCacheManager:
             normalize_embeddings=normalize_embeddings,
             prefix_config_hash=prefix_config_hash,
             created_at=existing.created_at if existing else datetime.now().isoformat(),
+            cache_version=2,  # Always save as v2
+            normalizer_config_hash=normalizer_config_hash,
         )
         self._save_metadata(metadata)
         if is_new:
-            logger.info(f"  Cache metadata saved: model={embedding_model}, dim={embedding_dim}")
+            logger.info(f"  Cache metadata saved: model={embedding_model}, dim={embedding_dim}, version=2")
     
     def _load_index(self) -> Dict[str, Any]:
         if not self.index_file.exists():
@@ -288,6 +398,180 @@ class EmbeddingCacheManager:
         with self._lock:
             if self._dirty and self._index is not None:
                 self._save_index()
+            if self._tag_mapping_dirty and self._tag_mapping is not None:
+                self._save_tag_mapping()
+    
+    # ==================== Tag Mapping Methods ====================
+    
+    def _load_tag_mapping(self) -> Dict[str, Any]:
+        """Load tag mapping from disk."""
+        if not self.tag_mapping_file.exists():
+            return {
+                "fingerprint_to_tag": {},
+                "tag_to_fingerprints": {},
+                "fingerprint_to_faiss_id": {},
+                "faiss_id_to_fingerprint": {},
+            }
+        try:
+            with open(self.tag_mapping_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load tag mapping: {e}")
+            return {
+                "fingerprint_to_tag": {},
+                "tag_to_fingerprints": {},
+                "fingerprint_to_faiss_id": {},
+                "faiss_id_to_fingerprint": {},
+            }
+    
+    def _save_tag_mapping(self) -> None:
+        """Save tag mapping to disk atomically."""
+        if self._tag_mapping is None:
+            return
+        temp_file = self.tag_mapping_file.with_suffix('.json.tmp')
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(self._tag_mapping, f, default=json_default)
+        temp_file.replace(self.tag_mapping_file)
+        self._tag_mapping_dirty = False
+    
+    @property
+    def tag_mapping(self) -> Dict[str, Any]:
+        """Get tag mapping, loading from disk if needed."""
+        with self._lock:
+            if self._tag_mapping is None:
+                self._tag_mapping = self._load_tag_mapping()
+            return self._tag_mapping
+    
+    def get_tag_for_fingerprint(self, fingerprint: str) -> Optional[str]:
+        """Get the tag associated with a fingerprint."""
+        return self.tag_mapping.get("fingerprint_to_tag", {}).get(fingerprint)
+    
+    def get_fingerprints_for_tag(self, tag: str) -> List[str]:
+        """Get all fingerprints associated with a tag."""
+        return self.tag_mapping.get("tag_to_fingerprints", {}).get(tag, [])
+    
+    def get_faiss_id_for_fingerprint(self, fingerprint: str) -> Optional[int]:
+        """Get the FAISS ID for a fingerprint."""
+        id_str = self.tag_mapping.get("fingerprint_to_faiss_id", {}).get(fingerprint)
+        return int(id_str) if id_str is not None else None
+    
+    def get_fingerprint_for_faiss_id(self, faiss_id: int) -> Optional[str]:
+        """Get the fingerprint for a FAISS ID."""
+        return self.tag_mapping.get("faiss_id_to_fingerprint", {}).get(str(faiss_id))
+    
+    def update_tag_mapping(
+        self,
+        fingerprint: str,
+        tag: str,
+        faiss_id: Optional[int] = None
+    ) -> None:
+        """
+        Update tag mapping for a fingerprint.
+        
+        Args:
+            fingerprint: The question fingerprint
+            tag: The associated tag
+            faiss_id: Optional FAISS ID (computed from fingerprint if not provided)
+        """
+        with self._lock:
+            mapping = self.tag_mapping
+            
+            # Update fingerprint -> tag
+            mapping.setdefault("fingerprint_to_tag", {})[fingerprint] = tag
+            
+            # Update tag -> fingerprints
+            tag_fps = mapping.setdefault("tag_to_fingerprints", {})
+            if tag not in tag_fps:
+                tag_fps[tag] = []
+            if fingerprint not in tag_fps[tag]:
+                tag_fps[tag].append(fingerprint)
+            
+            # Update FAISS ID mappings
+            if faiss_id is None:
+                faiss_id = self.fingerprint_to_faiss_id(fingerprint)
+            
+            mapping.setdefault("fingerprint_to_faiss_id", {})[fingerprint] = str(faiss_id)
+            mapping.setdefault("faiss_id_to_fingerprint", {})[str(faiss_id)] = fingerprint
+            
+            self._tag_mapping_dirty = True
+    
+    def update_tag_mappings_batch(
+        self,
+        fp_map: Dict[str, RowInfo]
+    ) -> None:
+        """
+        Update tag mappings for multiple fingerprints at once.
+        
+        Args:
+            fp_map: Dict mapping fingerprint -> RowInfo
+        """
+        with self._lock:
+            mapping = self.tag_mapping
+            fp_to_tag = mapping.setdefault("fingerprint_to_tag", {})
+            tag_to_fps = mapping.setdefault("tag_to_fingerprints", {})
+            fp_to_faiss = mapping.setdefault("fingerprint_to_faiss_id", {})
+            faiss_to_fp = mapping.setdefault("faiss_id_to_fingerprint", {})
+            
+            for fingerprint, row_info in fp_map.items():
+                tag = row_info.tag
+                faiss_id = self.fingerprint_to_faiss_id(fingerprint)
+                
+                # Update all mappings
+                fp_to_tag[fingerprint] = tag
+                
+                if tag not in tag_to_fps:
+                    tag_to_fps[tag] = []
+                if fingerprint not in tag_to_fps[tag]:
+                    tag_to_fps[tag].append(fingerprint)
+                
+                fp_to_faiss[fingerprint] = str(faiss_id)
+                faiss_to_fp[str(faiss_id)] = fingerprint
+            
+            self._tag_mapping_dirty = True
+    
+    def remove_from_tag_mapping(self, fingerprints: Set[str]) -> int:
+        """
+        Remove fingerprints from tag mapping.
+        
+        Args:
+            fingerprints: Set of fingerprints to remove
+            
+        Returns:
+            Number of fingerprints removed
+        """
+        with self._lock:
+            mapping = self.tag_mapping
+            fp_to_tag = mapping.get("fingerprint_to_tag", {})
+            tag_to_fps = mapping.get("tag_to_fingerprints", {})
+            fp_to_faiss = mapping.get("fingerprint_to_faiss_id", {})
+            faiss_to_fp = mapping.get("faiss_id_to_fingerprint", {})
+            
+            removed = 0
+            for fp in fingerprints:
+                if fp in fp_to_tag:
+                    tag = fp_to_tag.pop(fp)
+                    if tag in tag_to_fps and fp in tag_to_fps[tag]:
+                        tag_to_fps[tag].remove(fp)
+                        if not tag_to_fps[tag]:
+                            del tag_to_fps[tag]
+                    removed += 1
+                
+                if fp in fp_to_faiss:
+                    faiss_id_str = fp_to_faiss.pop(fp)
+                    if faiss_id_str in faiss_to_fp:
+                        del faiss_to_fp[faiss_id_str]
+            
+            if removed > 0:
+                self._tag_mapping_dirty = True
+            
+            return removed
+    
+    def save_tag_mapping(self) -> None:
+        """Save tag mapping to disk (with file lock)."""
+        with self._acquire_file_lock("save_tag_mapping"):
+            with self._lock:
+                if self._tag_mapping is not None:
+                    self._save_tag_mapping()
     
     def detect_changes(self, current_fingerprints: Set[str]) -> ChangeSet:
         cached_fingerprints = set(self.index.get("entries", {}).keys())
@@ -321,12 +605,16 @@ class EmbeddingCacheManager:
         return removed
     
     def remove_from_index(self, fingerprints: Set[str]) -> int:
-        """Remove fingerprints from the index. Uses file lock for cross-process safety."""
+        """Remove fingerprints from the index and tag mapping. Uses file lock for cross-process safety."""
         with self._acquire_file_lock("remove_from_index"):
             with self._lock:
                 removed = self._remove_from_index_no_save(fingerprints)
                 if removed > 0:
                     self._save_index()
+                    # Also remove from tag mapping
+                    self.remove_from_tag_mapping(fingerprints)
+                    if self._tag_mapping_dirty:
+                        self._save_tag_mapping()
                 return removed
     
     def _tag_filename(self, tag: str) -> str:
@@ -444,6 +732,11 @@ class EmbeddingCacheManager:
         new_embeddings: np.ndarray,
         fp_map: Dict[str, RowInfo]
     ) -> None:
+        """
+        Save new embeddings to cache, organized by tag.
+        
+        Also updates the tag mapping for the new fingerprints.
+        """
         fp_list = new_fingerprints
         
         if len(fp_list) != new_embeddings.shape[0]:
@@ -463,6 +756,11 @@ class EmbeddingCacheManager:
             tag_embeddings = new_embeddings[indices]
             
             self.append_embeddings_to_tag(tag, tag_embeddings, fps)
+        
+        # Update tag mapping for new fingerprints
+        new_fp_map = {fp: fp_map[fp] for fp in fp_list}
+        self.update_tag_mappings_batch(new_fp_map)
+        self.save_tag_mapping()
         
         logger.info(f"  Saved {len(fp_list)} embeddings to cache ({len(tag_groups)} tags updated)")
     
@@ -529,10 +827,14 @@ class EmbeddingCacheManager:
                     self.index_file.unlink()
                 if self.metadata_file.exists():
                     self.metadata_file.unlink()
+                if self.tag_mapping_file.exists():
+                    self.tag_mapping_file.unlink()
                 
                 self._index = None
                 self._metadata = None
+                self._tag_mapping = None
                 self._dirty = False
+                self._tag_mapping_dirty = False
                 
                 logger.info(f"Cleared {self.cache_type} embedding cache")
     
@@ -751,3 +1053,118 @@ def get_sts_prefix_hash(prefix_config) -> str:
     
     cache_key = json.dumps(cache_data, sort_keys=True)
     return hashlib.sha256(cache_key.encode('utf-8')).hexdigest()[:32]
+
+
+def get_normalizer_config_hash(normalizer) -> str:
+    """
+    Compute hash of text normalizer configuration.
+    
+    This ensures cache invalidation when normalization settings change,
+    since fingerprints are computed on normalized text.
+    """
+    if normalizer is None:
+        return ""
+    
+    cache_data = {
+        'unicode_normalize': getattr(normalizer, 'unicode_normalize', True),
+        'case_fold': getattr(normalizer, 'case_fold', True),
+        'strip_diacritics': getattr(normalizer, 'strip_diacritics_enabled', False),
+        'remove_punctuation': getattr(normalizer, 'remove_punctuation', True),
+        'normalize_whitespace': getattr(normalizer, 'normalize_whitespace', True),
+    }
+    
+    cache_key = json.dumps(cache_data, sort_keys=True)
+    return hashlib.sha256(cache_key.encode('utf-8')).hexdigest()[:32]
+
+
+def detect_cache_version(cache_dir: Path) -> int:
+    """
+    Detect the cache version from a cache directory.
+    
+    Returns:
+        1 for v1 cache (question+tag fingerprints)
+        2 for v2 cache (question-only fingerprints)
+        0 if cache doesn't exist or is empty
+    """
+    metadata_file = cache_dir / "metadata.json"
+    if not metadata_file.exists():
+        return 0
+    
+    try:
+        with open(metadata_file, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+        return metadata.get('cache_version', 1)  # Default to v1 for old caches
+    except Exception:
+        return 0
+
+
+def needs_cache_migration(cache_dir: Path, target_version: int = 2) -> bool:
+    """
+    Check if a cache directory needs migration to a newer version.
+    
+    Args:
+        cache_dir: Path to cache directory
+        target_version: Target cache version (default: 2)
+        
+    Returns:
+        True if cache exists and is older than target version
+    """
+    current_version = detect_cache_version(cache_dir)
+    if current_version == 0:
+        return False  # No cache exists, no migration needed
+    return current_version < target_version
+
+
+class CacheMigrationInfo:
+    """Information about cache migration status."""
+    
+    def __init__(self, cache_dir: Path):
+        self.cache_dir = cache_dir
+        self.current_version = detect_cache_version(cache_dir)
+        self.needs_migration = self.current_version > 0 and self.current_version < 2
+        
+    def get_status_message(self) -> str:
+        if self.current_version == 0:
+            return "No existing cache found"
+        elif self.needs_migration:
+            return f"Cache v{self.current_version} found - migration to v2 required (will trigger full rebuild)"
+        else:
+            return f"Cache v{self.current_version} - up to date"
+
+
+def migrate_cache_v1_to_v2(
+    old_cache_dir: Path,
+    auto_clear: bool = True
+) -> bool:
+    """
+    Migrate a v1 cache to v2 by clearing it (requires full rebuild).
+    
+    V1 to V2 migration cannot preserve embeddings because:
+    - V1 fingerprints: SHA256(question + tag)
+    - V2 fingerprints: SHA256(normalized_question)
+    
+    The fingerprints are fundamentally different, so we must clear and rebuild.
+    
+    Args:
+        old_cache_dir: Path to v1 cache directory
+        auto_clear: If True, automatically clear the cache
+        
+    Returns:
+        True if migration was needed and performed
+    """
+    if not needs_cache_migration(old_cache_dir):
+        return False
+    
+    logger.info(f"Migrating cache from v1 to v2: {old_cache_dir}")
+    logger.info("  V1 caches use question+tag fingerprints, V2 uses question-only")
+    logger.info("  This requires a full rebuild of embeddings")
+    
+    if auto_clear:
+        # Clear the old cache
+        cache_manager = EmbeddingCacheManager(old_cache_dir, "migration")
+        cache_manager.clear()
+        logger.info("  [OK] V1 cache cleared, ready for v2 rebuild")
+        return True
+    
+    logger.warning("  Cache migration requires clearing - set auto_clear=True to proceed")
+    return False

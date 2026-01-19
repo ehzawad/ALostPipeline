@@ -12,6 +12,9 @@ from contextlib import contextmanager
 from filelock import FileLock, Timeout as FileLockTimeout
 
 from ..config import NLPPipelineConfig
+from .data_validator import DataValidator, DataPollutionError, ValidationResult
+from ..preprocessing.normalizer import TextNormalizer, DEFAULT_NORMALIZER
+from ..cache.embedding_cache import get_normalizer_config_hash
 
 @contextmanager
 def build_lock(lock_file: Path, timeout: float = 300.0):
@@ -70,21 +73,31 @@ class BuildOrchestrator:
         verbose: bool = True,
         inference_only: bool = False,
         force_rebuild: bool = False,
-        dry_run: bool = False
+        dry_run: bool = False,
+        validate_data: bool = True,
+        normalizer: Optional[TextNormalizer] = None,
     ):
         self.config = config or NLPPipelineConfig()
         self.verbose = verbose
         self.inference_only = inference_only
         self.force_rebuild = force_rebuild
         self.dry_run = dry_run
+        self.validate_data = validate_data
+        self.normalizer = normalizer or DEFAULT_NORMALIZER
         
         self.dependency_graph = self._build_dependency_graph()
+        
+        # Data validator for detecting data pollution
+        self._validator = DataValidator(normalizer=self.normalizer)
+        self._validation_result: Optional[ValidationResult] = None
 
         logger.info("Initializing build orchestrator...")
         if self.force_rebuild:
             logger.warning("  Force rebuild enabled (will ignore content fingerprints)")
         if self.dry_run:
             logger.warning("  Dry run enabled (no changes will be made)")
+        if not self.validate_data:
+            logger.warning("  Data validation disabled (not recommended)")
 
         from .fingerprint import (
             compute_dataset_fingerprint,
@@ -337,6 +350,13 @@ class BuildOrchestrator:
                 if stored_use_instruct is not None and stored_use_instruct != self.config.prefixes.use_instruct_format:
                     logger.debug(f"  {artifact_name}: use_instruct_format changed")
                     return True
+                
+                # Check normalizer config (v2 cache scheme)
+                current_normalizer_hash = self.get_normalizer_config_hash()
+                stored_normalizer_hash = deps.get("normalizer_config_hash")
+                if stored_normalizer_hash and stored_normalizer_hash != current_normalizer_hash:
+                    logger.debug(f"  {artifact_name}: normalizer config changed")
+                    return True
 
                 return False
             except Exception as e:
@@ -543,6 +563,41 @@ class BuildOrchestrator:
             results[artifact_name] = entry
 
         return results
+    
+    def validate_dataset(self, fail_on_duplicates: bool = True) -> ValidationResult:
+        """
+        Validate the training dataset for data quality issues.
+        
+        This checks for duplicate questions across different tags (data pollution).
+        
+        Args:
+            fail_on_duplicates: If True, raise DataPollutionError on duplicates
+            
+        Returns:
+            ValidationResult with validation status and any issues found
+            
+        Raises:
+            DataPollutionError: If duplicates found and fail_on_duplicates is True
+        """
+        logger.info("Validating training dataset...")
+        
+        result = self._validator.validate_and_fail_on_duplicates(
+            self.config.dataset.train_csv,
+            raise_on_duplicates=fail_on_duplicates
+        )
+        
+        self._validation_result = result
+        
+        if result.valid:
+            logger.info(f"  [OK] Data validation passed: {result.unique_questions} unique questions")
+        else:
+            logger.error(f"  [FAIL] Data pollution detected: {result.duplicate_count} duplicates")
+        
+        return result
+    
+    def get_normalizer_config_hash(self) -> str:
+        """Get the hash of the normalizer configuration."""
+        return get_normalizer_config_hash(self.normalizer)
 
     def build_all(
         self,
@@ -556,6 +611,26 @@ class BuildOrchestrator:
         from .executor import BuildExecutor
 
         start_time = time.time()
+        
+        # Phase 1: Data validation (fail early on data pollution)
+        if self.validate_data:
+            logger.info("\n" + "=" * 60)
+            logger.info("PHASE 1: Data Validation")
+            logger.info("=" * 60)
+            try:
+                validation_result = self.validate_dataset(fail_on_duplicates=True)
+                if validation_result.warnings:
+                    for warning in validation_result.warnings:
+                        logger.warning(f"  Warning: {warning}")
+            except DataPollutionError as e:
+                logger.error("\n" + e.validation_result.get_report())
+                return BuildResult(
+                    success=False,
+                    rebuilt_artifacts=[],
+                    skipped_artifacts=list(self.dependency_graph.keys()),
+                    failed_artifacts={"data_validation": str(e)},
+                    duration=time.time() - start_time
+                )
 
         rebuild_list = self.calculate_rebuild_set(force=force, artifacts=artifacts)
 

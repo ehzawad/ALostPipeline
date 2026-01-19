@@ -7,6 +7,13 @@ from .fingerprint import (
     compute_classifier_fingerprint,
     compute_faiss_fingerprint
 )
+from .data_validator import (
+    DataValidator,
+    DataPollutionError,
+    ValidationResult,
+    DuplicateEntry,
+    validate_dataset,
+)
 
 __all__ = [
     'BuildOrchestrator',
@@ -15,5 +22,10 @@ __all__ = [
     'compute_dataset_fingerprint',
     'compute_ngram_fingerprint',
     'compute_classifier_fingerprint',
-    'compute_faiss_fingerprint'
+    'compute_faiss_fingerprint',
+    'DataValidator',
+    'DataPollutionError',
+    'ValidationResult',
+    'DuplicateEntry',
+    'validate_dataset',
 ]

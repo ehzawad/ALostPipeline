@@ -19,9 +19,17 @@ if str(ROOT_DIR) not in sys.path:
 
 from nlpcomponents.config import EmbeddingPrefixConfig, DEFAULT_E5_INSTRUCT_TASK, DEFAULT_EMBEDDING_MODEL
 from nlpcomponents.build.fingerprint import compute_fingerprint
+from nlpcomponents.build.data_validator import DataValidator, DataPollutionError
 from nlpcomponents.cache.model_cache import get_default_device
-from nlpcomponents.cache.embedding_cache import EmbeddingCacheManager, get_prefix_config_hash, get_sts_prefix_hash
+from nlpcomponents.cache.embedding_cache import (
+    EmbeddingCacheManager, 
+    get_prefix_config_hash, 
+    get_sts_prefix_hash,
+    get_normalizer_config_hash,
+    ChangeSet,
+)
 from nlpcomponents.build.fingerprint import compute_dataset_fingerprint, compute_classifier_fingerprint
+from nlpcomponents.preprocessing.normalizer import TextNormalizer, DEFAULT_NORMALIZER
 from nlpcomponents.utils.faiss_utils import get_faiss, is_gpu_available, index_cpu_to_gpu, index_gpu_to_cpu, get_device_string
 from nlpcomponents.utils.path_utils import DATASETS_DIR, SEMANTIC_MODELS_DIR, CLASSIFIER_MODELS_DIR
 from nlpcomponents.utils.json_utils import json_default
@@ -38,16 +46,22 @@ class STSTrainer:
         prefixes: Optional[EmbeddingPrefixConfig] = None,
         cache_dir: Optional[Path] = None,
         use_embedding_cache: bool = True,
+        normalizer: Optional[TextNormalizer] = None,
     ):
         self.embedding_model_name = embedding_model
         self.normalize_embeddings = normalize_embeddings
         self.prefixes = prefixes or EmbeddingPrefixConfig()
         self.cache_dir = cache_dir
         self.use_embedding_cache = use_embedding_cache
+        self.normalizer = normalizer or DEFAULT_NORMALIZER
         
         self.embedding_model = None
         self.embedding_dim: Optional[int] = None
         self.use_unified_embeddings = False
+        
+        # For incremental updates
+        self._fp_map: Optional[dict] = None
+        self._changes: Optional[ChangeSet] = None
 
     def load_data(self, train_file: Path):
         logger.info("Loading training data...")
@@ -132,6 +146,7 @@ class STSTrainer:
         
         # Use STS-specific hash to avoid invalidation when classifier-only settings change
         prefix_hash = get_sts_prefix_hash(self.prefixes)
+        normalizer_hash = get_normalizer_config_hash(self.normalizer)
         embedding_dim = self.embedding_dim
         
         if cache.exists():
@@ -139,15 +154,21 @@ class STSTrainer:
                 embedding_model=self.embedding_model_name,
                 embedding_dim=embedding_dim,
                 normalize_embeddings=self.normalize_embeddings,
-                prefix_config_hash=prefix_hash
+                prefix_config_hash=prefix_hash,
+                normalizer_config_hash=normalizer_hash
             ):
                 logger.info("  Cache invalidated (config changed), clearing...")
                 cache.clear()
         
         df = pd.DataFrame({'question': questions, 'tag': tags})
-        fp_map = cache.compute_fingerprints_batch(df)
+        # Use normalizer for v2 fingerprinting (question-only, normalized)
+        fp_map = cache.compute_fingerprints_batch(df, normalizer=self.normalizer)
         
         changes = cache.detect_changes(set(fp_map.keys()))
+        
+        # Store for incremental FAISS updates
+        self._fp_map = fp_map
+        self._changes = changes
         
         logger.info(f"  Embedding cache: {len(changes.unchanged)} cached, {len(changes.new)} new, {len(changes.deleted)} orphaned")
         
@@ -180,19 +201,41 @@ class STSTrainer:
             embedding_model=self.embedding_model_name,
             embedding_dim=embedding_dim,
             normalize_embeddings=self.normalize_embeddings,
-            prefix_config_hash=prefix_hash
+            prefix_config_hash=prefix_hash,
+            normalizer_config_hash=normalizer_hash
         )
         
         if changes.deleted:
             cache.remove_from_index(changes.deleted)
         
-        ordered_fps = [cache.compute_fingerprint(q, t) for q, t in zip(questions, tags)]
+        # Use normalized fingerprints (no tag in v2 scheme)
+        ordered_fps = [
+            cache.compute_fingerprint(self.normalizer.normalize(q))
+            for q in questions
+        ]
         embeddings = cache.assemble_embeddings(ordered_fps, embedding_dim=embedding_dim)
         
         logger.info(f"  [OK] Generated embeddings: shape={embeddings.shape}, dtype={embeddings.dtype}")
         return embeddings
 
-    def build_faiss_indices(self, embeddings, indices_to_build='global', use_gpu: bool = True):
+    def build_faiss_indices(
+        self, 
+        embeddings, 
+        indices_to_build='global', 
+        use_gpu: bool = True,
+        fingerprints: Optional[list] = None
+    ):
+        """
+        Build FAISS indices with content-hash IDs for incremental updates.
+        
+        Uses IndexIDMap2 wrapper to support add_with_ids and remove_ids operations.
+        
+        Args:
+            embeddings: Embedding vectors to add
+            indices_to_build: Which indices to build (only 'global' supported)
+            use_gpu: Whether to use GPU for building
+            fingerprints: List of fingerprints for each embedding (for content-hash IDs)
+        """
         logger.info("\nBuilding FAISS indices...")
         if self.embedding_dim is None:
             raise ValueError("embedding_dim not set; generate embeddings before building indices.")
@@ -201,45 +244,124 @@ class STSTrainer:
         if indices_to_build not in ('all', 'global', None):
             logger.warning("Class-specific indices are no longer supported; building global index only.")
 
-        logger.info("  Building global index...")
+        logger.info("  Building global index with IndexIDMap2 (supports incremental updates)...")
         logger.info(f"  FAISS device: {get_device_string()}")
 
         start_time = time.time()
         faiss_mod = get_faiss()
         
-        index_global = faiss_mod.IndexFlatIP(self.embedding_dim)
+        # Use IndexIDMap2 to support content-hash IDs and removal
+        base_index = faiss_mod.IndexFlatIP(self.embedding_dim)
+        index_global = faiss_mod.IndexIDMap2(base_index)
+        
+        # Generate FAISS IDs from fingerprints
+        if fingerprints is not None:
+            ids = np.array([
+                EmbeddingCacheManager.fingerprint_to_faiss_id(fp) 
+                for fp in fingerprints
+            ], dtype=np.int64)
+            logger.info(f"  Using content-hash IDs (from {len(fingerprints)} fingerprints)")
+        else:
+            # Fallback to sequential IDs if no fingerprints provided
+            ids = np.arange(len(embeddings_f32), dtype=np.int64)
+            logger.warning("  No fingerprints provided, using sequential IDs (incremental updates disabled)")
         
         gpu_used = False
-        gpu_index = None
         if use_gpu and is_gpu_available():
             try:
-                gpu_index, moved = index_cpu_to_gpu(index_global)
-                if moved:
-                    gpu_index.add(embeddings_f32)
-                    index_global = index_gpu_to_cpu(gpu_index)
-                    gpu_used = True
-                    logger.info("  [GPU] Index built on GPU, converted to CPU for saving")
-                else:
-                    index_global.add(embeddings_f32)
+                # For IndexIDMap2, we need to add on CPU then potentially move
+                # GPU doesn't support IndexIDMap2 directly, so we build on CPU
+                index_global.add_with_ids(embeddings_f32, ids)
+                logger.info("  Index built on CPU (IndexIDMap2 requires CPU)")
             except Exception as e:
-                logger.warning(f"  GPU index building failed, falling back to CPU: {e}")
-                index_global.add(embeddings_f32)
-            finally:
-                # Always clean up GPU resources, even on failure
-                if gpu_index is not None:
-                    del gpu_index
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                logger.warning(f"  Index building failed: {e}")
+                raise
         else:
-            index_global.add(embeddings_f32)
+            index_global.add_with_ids(embeddings_f32, ids)
         
         build_time = time.time() - start_time
 
         device_str = "GPU" if gpu_used else "CPU"
         logger.info(f"  [OK] Global index built on {device_str}: {index_global.ntotal:,} vectors in {build_time:.2f}s")
+        logger.info(f"  Index type: IndexIDMap2(IndexFlatIP) - supports incremental updates")
+        
         return {'global': index_global}
+    
+    def load_existing_index(self, index_path: Path) -> Optional["faiss.Index"]:
+        """Load an existing FAISS index for incremental updates."""
+        if not index_path.exists():
+            return None
+        
+        faiss_mod = get_faiss()
+        try:
+            index = faiss_mod.read_index(str(index_path))
+            logger.info(f"  Loaded existing index: {index.ntotal:,} vectors")
+            return index
+        except Exception as e:
+            logger.warning(f"  Failed to load existing index: {e}")
+            return None
+    
+    def update_index_incremental(
+        self,
+        index: "faiss.Index",
+        changes: ChangeSet,
+        new_embeddings: np.ndarray,
+        new_fingerprints: list
+    ) -> "faiss.Index":
+        """
+        Incrementally update a FAISS index with changes.
+        
+        Args:
+            index: Existing FAISS IndexIDMap2 index
+            changes: ChangeSet with new, deleted, unchanged fingerprints
+            new_embeddings: Embeddings for new questions
+            new_fingerprints: Fingerprints for new questions
+            
+        Returns:
+            Updated index
+        """
+        faiss_mod = get_faiss()
+        
+        # Remove deleted entries
+        if changes.deleted:
+            delete_ids = np.array([
+                EmbeddingCacheManager.fingerprint_to_faiss_id(fp)
+                for fp in changes.deleted
+            ], dtype=np.int64)
+            
+            # Create ID selector for removal
+            id_selector = faiss_mod.IDSelectorArray(delete_ids)
+            removed = index.remove_ids(id_selector)
+            logger.info(f"  Removed {removed} deleted vectors from index")
+        
+        # Add new entries
+        if changes.new and len(new_embeddings) > 0:
+            new_ids = np.array([
+                EmbeddingCacheManager.fingerprint_to_faiss_id(fp)
+                for fp in new_fingerprints
+            ], dtype=np.int64)
+            
+            index.add_with_ids(new_embeddings.astype('float32'), new_ids)
+            logger.info(f"  Added {len(new_embeddings)} new vectors to index")
+        
+        logger.info(f"  Index now has {index.ntotal:,} vectors")
+        return index
 
-    def save_artifacts(self, indices, embeddings, df, output_dir: Path, fingerprint: str | None = None, dependencies: dict | None = None):
+    def save_artifacts(
+        self, 
+        indices, 
+        embeddings, 
+        df, 
+        output_dir: Path, 
+        fingerprint: str | None = None, 
+        dependencies: dict | None = None,
+        fp_map: dict | None = None
+    ):
+        """
+        Save training artifacts including FAISS indices, embeddings, and metadata.
+        
+        Also saves a FAISS ID lookup file for mapping between fingerprints and FAISS IDs.
+        """
         logger.info("\nSaving artifacts...")
         faiss_mod = get_faiss()
 
@@ -260,6 +382,24 @@ class STSTrainer:
         mapping_file = output_dir / "question_mapping.csv"
         df[['question', 'tag']].to_csv(mapping_file, index=False)
         logger.info(f"  [OK] Question mapping: {mapping_file.name}")
+        
+        # Save FAISS ID lookup for incremental updates
+        if fp_map is not None:
+            id_lookup = {
+                "id_to_fingerprint": {},
+                "fingerprint_to_id": {},
+                "fingerprint_to_tag": {},
+            }
+            for fp, row_info in fp_map.items():
+                faiss_id = EmbeddingCacheManager.fingerprint_to_faiss_id(fp)
+                id_lookup["id_to_fingerprint"][str(faiss_id)] = fp
+                id_lookup["fingerprint_to_id"][fp] = faiss_id
+                id_lookup["fingerprint_to_tag"][fp] = row_info.tag
+            
+            id_lookup_file = output_dir / "faiss_id_lookup.json"
+            with open(id_lookup_file, 'w', encoding='utf-8') as f:
+                json.dump(id_lookup, f, indent=2, default=json_default)
+            logger.info(f"  [OK] FAISS ID lookup: {id_lookup_file.name} ({len(fp_map)} entries)")
 
         metadata = {
             'embedding_model': self.embedding_model_name,
@@ -275,6 +415,8 @@ class STSTrainer:
             'indices': {
                 'global': indices['global'].ntotal,
             },
+            'index_type': 'IndexIDMap2(IndexFlatIP)',
+            'supports_incremental': True,
             'fingerprint': fingerprint,
             'dependencies': dependencies or {},
             **self.prefixes.get_metadata()
@@ -299,11 +441,27 @@ def train_sts(
     normalize_embeddings: bool = True,
     prefixes: Optional[EmbeddingPrefixConfig] = None,
     cache_dir: Optional[Path] = None,
-    use_embedding_cache: bool = True
+    use_embedding_cache: bool = True,
+    validate_data: bool = True,
+    normalizer: Optional[TextNormalizer] = None
 ):
     print("=" * 80)
     print("STS TRAINING - BUILD FAISS INDICES")
     print("=" * 80)
+    
+    normalizer = normalizer or DEFAULT_NORMALIZER
+
+    # Phase 1: Data validation (fail early on data pollution)
+    if validate_data:
+        print("\nPhase 1: Data Validation")
+        print("-" * 40)
+        validator = DataValidator(normalizer=normalizer)
+        try:
+            result = validator.validate_and_fail_on_duplicates(train_file, raise_on_duplicates=True)
+            print(f"  [OK] Data validation passed: {result.unique_questions} unique questions")
+        except DataPollutionError as e:
+            print("\n" + e.validation_result.get_report())
+            raise
 
     trainer = STSTrainer(
         embedding_model=embedding_model,
@@ -311,16 +469,19 @@ def train_sts(
         prefixes=prefixes,
         cache_dir=cache_dir,
         use_embedding_cache=use_embedding_cache,
+        normalizer=normalizer,
     )
 
     metadata_file = models_dir / "sts_metadata.json"
     cache_inputs = [train_file]
     
+    normalizer_hash = get_normalizer_config_hash(normalizer)
     cache_extra = json.dumps({
         'embedding_model': trainer.embedding_model_name,
         'normalize_embeddings': trainer.normalize_embeddings,
         'indices_to_build': indices_to_build,
-        'embedding_prefix_config': trainer.prefixes.get_cache_key()
+        'embedding_prefix_config': trainer.prefixes.get_cache_key(),
+        'normalizer_config_hash': normalizer_hash,
     }, sort_keys=True)
     fingerprint = compute_fingerprint(cache_inputs, cache_extra)
 
@@ -346,10 +507,22 @@ def train_sts(
         df['question'].tolist(),
         df['tag'].tolist()
     )
+    
+    # Get fingerprints for FAISS index IDs
+    fp_map = trainer._fp_map
+    if fp_map is not None:
+        # Get fingerprints in same order as embeddings
+        fingerprints = [
+            EmbeddingCacheManager.compute_fingerprint(normalizer.normalize(q))
+            for q in df['question'].tolist()
+        ]
+    else:
+        fingerprints = None
 
     indices = trainer.build_faiss_indices(
         embeddings,
-        indices_to_build=indices_to_build
+        indices_to_build=indices_to_build,
+        fingerprints=fingerprints
     )
 
     dataset_fp = compute_dataset_fingerprint(train_file)
@@ -369,7 +542,12 @@ def train_sts(
             'file': 'unified_tag_classifier.pth'
         }
 
-    metadata = trainer.save_artifacts(indices, embeddings, df, models_dir, fingerprint=fingerprint, dependencies=dependencies)
+    metadata = trainer.save_artifacts(
+        indices, embeddings, df, models_dir, 
+        fingerprint=fingerprint, 
+        dependencies=dependencies,
+        fp_map=fp_map
+    )
 
     print("\n" + "=" * 80)
     print("[SUCCESS] STS TRAINING COMPLETE!")
@@ -380,6 +558,8 @@ def train_sts(
     print(f"  Tags:             {metadata['num_tags']}")
     print(f"  Embedding dim:    {metadata['embedding_dim']}")
     print(f"  Indices created:  {len(indices)}")
+    print(f"  Index type:       {metadata.get('index_type', 'Unknown')}")
+    print(f"  Incremental:      {metadata.get('supports_incremental', False)}")
     print(f"\nIndices built:")
     for name, size in metadata['indices'].items():
         print(f"  {name:25s}: {size:,} vectors")
@@ -499,6 +679,11 @@ if __name__ == '__main__':
         action='store_true',
         help='Disable embedding cache (encode all questions fresh)'
     )
+    parser.add_argument(
+        '--no-validate',
+        action='store_true',
+        help='Skip data validation (not recommended)'
+    )
     
     args = parser.parse_args()
 
@@ -534,4 +719,5 @@ if __name__ == '__main__':
         prefixes=prefixes,
         cache_dir=cache_dir,
         use_embedding_cache=not args.no_embedding_cache,
+        validate_data=not args.no_validate,
     )

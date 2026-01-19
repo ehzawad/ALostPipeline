@@ -173,6 +173,21 @@ class RankerConfig:
 
 
 @dataclass
+class CacheConfig:
+    """Configuration for embedding cache behavior."""
+    
+    # V2 cache scheme features
+    use_v2_cache_scheme: bool = True  # Use normalized question-only fingerprints
+    auto_migrate_v1_cache: bool = True  # Auto-detect and migrate v1 caches
+    
+    # Data validation
+    validate_data_on_build: bool = True  # Fail build on data pollution
+    
+    # FAISS index features
+    use_incremental_faiss: bool = True  # Use IndexIDMap2 for incremental updates
+
+
+@dataclass
 class NLPPipelineConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
@@ -180,6 +195,7 @@ class NLPPipelineConfig:
     semantic: SemanticSearchConfig = field(default_factory=SemanticSearchConfig)
     classifier: TagClassifierConfig = field(default_factory=TagClassifierConfig)
     ranker: RankerConfig = field(default_factory=RankerConfig)
+    cache: CacheConfig = field(default_factory=CacheConfig)
     fusion_top_k: int = 1
     log_dir: Optional[Path] = None
 
@@ -203,6 +219,7 @@ class NLPPipelineConfig:
             semantic=SemanticSearchConfig(**data.get("semantic", {})) if data.get("semantic") else SemanticSearchConfig(),
             classifier=TagClassifierConfig(**data.get("classifier", {})) if data.get("classifier") else TagClassifierConfig(),
             ranker=RankerConfig(**data.get("ranker", {})) if data.get("ranker") else RankerConfig(),
+            cache=CacheConfig(**data.get("cache", {})) if data.get("cache") else CacheConfig(),
             fusion_top_k=data.get("fusion_top_k", 1),
             log_dir=data.get("log_dir")
         )

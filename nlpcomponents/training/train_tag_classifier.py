@@ -24,10 +24,17 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from nlpcomponents.cache.model_cache import get_shared_embedding_model, get_default_device, encode_queries
-from nlpcomponents.cache.embedding_cache import EmbeddingCacheManager, get_prefix_config_hash, get_classifier_prefix_hash
+from nlpcomponents.cache.embedding_cache import (
+    EmbeddingCacheManager, 
+    get_prefix_config_hash, 
+    get_classifier_prefix_hash,
+    get_normalizer_config_hash,
+)
 from nlpcomponents.build.fingerprint import compute_fingerprint
 from nlpcomponents.build.fingerprint import compute_dataset_fingerprint, compute_ngram_fingerprint
+from nlpcomponents.build.data_validator import DataValidator, DataPollutionError
 from nlpcomponents.config import EmbeddingPrefixConfig, DEFAULT_E5_INSTRUCT_TASK, DEFAULT_EMBEDDING_MODEL
+from nlpcomponents.preprocessing.normalizer import TextNormalizer, DEFAULT_NORMALIZER
 from nlpcomponents.inference import UnifiedTagClassifier, SupConLoss
 from nlpcomponents.utils.constants import NGRAM_TYPES
 from nlpcomponents.utils.ngram_utils import extract_ngram_words
@@ -61,7 +68,8 @@ class UnifiedTagClassifierTrainer:
         prefixes: Optional[EmbeddingPrefixConfig] = None,
         normalize_embeddings: bool = True,
         cache_dir: Optional[Path] = None,
-        use_embedding_cache: bool = True
+        use_embedding_cache: bool = True,
+        normalizer: Optional[TextNormalizer] = None,
     ):
         self.embedding_model_name = embedding_model
         self.contrastive_weight = contrastive_weight
@@ -73,6 +81,7 @@ class UnifiedTagClassifierTrainer:
         self.normalize_embeddings = normalize_embeddings
         self.cache_dir = cache_dir
         self.use_embedding_cache = use_embedding_cache
+        self.normalizer = normalizer or DEFAULT_NORMALIZER
 
     def load_data(self, train_file: Path, eval_file: Path):
         logger.info("Loading training and eval data...")
@@ -238,19 +247,22 @@ class UnifiedTagClassifierTrainer:
         
         # Use classifier-specific hash to avoid invalidation when STS-only settings change
         prefix_hash = get_classifier_prefix_hash(self.prefixes)
+        normalizer_hash = get_normalizer_config_hash(self.normalizer)
         
         if cache.exists():
             if not cache.validate_metadata(
                 embedding_model=self.embedding_model_name,
                 embedding_dim=embedding_dim,
                 normalize_embeddings=self.normalize_embeddings,
-                prefix_config_hash=prefix_hash
+                prefix_config_hash=prefix_hash,
+                normalizer_config_hash=normalizer_hash
             ):
                 logger.info("  Cache invalidated (config changed), clearing...")
                 cache.clear()
         
         df = pd.DataFrame({'question': questions, 'tag': tags})
-        fp_map = cache.compute_fingerprints_batch(df)
+        # Use normalizer for v2 fingerprinting (question-only, normalized)
+        fp_map = cache.compute_fingerprints_batch(df, normalizer=self.normalizer)
         
         changes = cache.detect_changes(set(fp_map.keys()))
         
@@ -289,10 +301,15 @@ class UnifiedTagClassifierTrainer:
             embedding_model=self.embedding_model_name,
             embedding_dim=embedding_dim,
             normalize_embeddings=self.normalize_embeddings,
-            prefix_config_hash=prefix_hash
+            prefix_config_hash=prefix_hash,
+            normalizer_config_hash=normalizer_hash
         )
         
-        ordered_fps = [cache.compute_fingerprint(q, t) for q, t in zip(questions, tags)]
+        # Use normalized fingerprints (no tag in v2 scheme)
+        ordered_fps = [
+            cache.compute_fingerprint(self.normalizer.normalize(q))
+            for q in questions
+        ]
         embeddings = cache.assemble_embeddings(ordered_fps, embedding_dim=embedding_dim)
         
         logger.info(f"  Embeddings shape: {embeddings.shape}")
@@ -774,6 +791,11 @@ def parse_args():
         action="store_true",
         help="Disable embedding cache (encode all questions fresh)"
     )
+    parser.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="Skip data validation (not recommended)"
+    )
     return parser.parse_args()
 
 def main():
@@ -794,6 +816,19 @@ def main():
     print(f"Using manual n-gram features")
     print(f"Contrastive weight: {args.contrastive_weight}")
     print()
+    
+    # Phase 1: Data validation (fail early on data pollution)
+    if not args.no_validate:
+        print("Phase 1: Data Validation")
+        print("-" * 40)
+        validator = DataValidator(normalizer=DEFAULT_NORMALIZER)
+        try:
+            result = validator.validate_and_fail_on_duplicates(args.train_csv, raise_on_duplicates=True)
+            print(f"  [OK] Data validation passed: {result.unique_questions} unique questions")
+        except DataPollutionError as e:
+            print("\n" + e.validation_result.get_report())
+            raise
+        print()
 
     try:
         logger.info("Initializing trainer...")
